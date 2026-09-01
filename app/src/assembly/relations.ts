@@ -10,6 +10,9 @@ export interface Relation {
   b: EntityRef;
   /** Meaning depends on type: planar/distance offset, both in mm. Ignored for concentric/parallel. */
   value: number;
+  /** Only meaningful for "planar": false (default) = faces flush facing each other
+   * (normals anti-parallel); true = faces facing the same way (normals parallel). */
+  flip?: boolean;
 }
 
 export const RELATION_LABELS: Record<RelationType, string> = {
@@ -89,8 +92,10 @@ export function relationResiduals(
       return [cross.x, cross.y, cross.z];
     }
     case "planar": {
-      // Faces flush & facing each other: normals anti-parallel, plane offset = value.
-      const sum = new THREE.Vector3().addVectors(a.direction, b.direction);
+      // Faces flush: normals anti-parallel by default (facing each other), or parallel
+      // (facing the same way) when flipped. Plane offset along a's normal = value.
+      const bDir = relation.flip ? b.direction.clone().negate() : b.direction;
+      const sum = new THREE.Vector3().addVectors(a.direction, bDir);
       const offset = new THREE.Vector3().subVectors(b.point, a.point).dot(a.direction) - relation.value;
       return [sum.x, sum.y, sum.z, offset];
     }

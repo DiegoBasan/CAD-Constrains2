@@ -1,5 +1,7 @@
+import * as THREE from "three";
 import { create } from "zustand";
-import type { EntityRef, ImportedAssembly, ImportedPart, Pose } from "../occ/types";
+import type { EntityRef, ImportedAssembly, ImportedPart, Pose, Vec3 } from "../occ/types";
+import { countConnectedBodies, splitPartMesh } from "../occ/split";
 import { applicableRelationTypes, resolveEntity, type Relation, type RelationType } from "./relations";
 import { solveAssembly } from "./solver";
 
@@ -8,6 +10,10 @@ export interface PartState {
   pose: Pose;
   fixed: boolean;
   visible: boolean;
+  /** True when this part's mesh is actually several disconnected bodies bundled
+   * together (common for STEP files that don't use proper assembly structure) —
+   * enables the "Separar" action in the tree panel. */
+  canSplit: boolean;
 }
 
 export type ViewPreset = "iso" | "front" | "top" | "right";
@@ -24,6 +30,9 @@ interface AssemblyStore {
 
   selectedPartId: string | null;
   pickedEntities: EntityRef[];
+  /** When set, the next entity pick replaces that side of the given relation
+   * instead of feeding the normal two-pick "new relation" flow. */
+  editingRelationSide: { relationId: string; side: "a" | "b" } | null;
   transformMode: TransformMode;
   requestedView: ViewPreset | null;
 
@@ -46,6 +55,12 @@ interface AssemblyStore {
 
   addRelation: (type: RelationType, value: number) => void;
   removeRelation: (id: string) => void;
+  toggleRelationFlip: (id: string) => void;
+  setRelationValue: (id: string, value: number) => void;
+  startEditRelationSide: (relationId: string, side: "a" | "b") => void;
+  cancelEditRelationSide: () => void;
+
+  splitPart: (partId: string) => void;
 
   runSolve: () => void;
 
@@ -64,6 +79,7 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
 
   selectedPartId: null,
   pickedEntities: [],
+  editingRelationSide: null,
   transformMode: "translate",
   requestedView: "iso",
 
@@ -84,6 +100,7 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
         pose: { position: [...part.initialPose.position], quaternion: [...part.initialPose.quaternion] },
         fixed: false,
         visible: true,
+        canSplit: countConnectedBodies(part.mesh) > 1,
       });
     });
     set({
@@ -109,6 +126,15 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
   selectPart: (partId) => set({ selectedPartId: partId, pickedEntities: [] }),
 
   pickEntity: (ref) => {
+    const editing = get().editingRelationSide;
+    if (editing) {
+      const relations = get().relations.map((r) =>
+        r.id === editing.relationId ? { ...r, [editing.side]: ref } : r,
+      );
+      set({ relations, editingRelationSide: null, selectedPartId: ref.partId });
+      get().runSolve();
+      return;
+    }
     const current = get().pickedEntities;
     const already = current.findIndex((e) => e.partId === ref.partId && e.kind === ref.kind && e.id === ref.id);
     if (already !== -1) {
@@ -160,6 +186,60 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
 
   removeRelation: (id) => {
     set({ relations: get().relations.filter((r) => r.id !== id) });
+    get().runSolve();
+  },
+
+  toggleRelationFlip: (id) => {
+    set({ relations: get().relations.map((r) => (r.id === id ? { ...r, flip: !r.flip } : r)) });
+    get().runSolve();
+  },
+
+  setRelationValue: (id, value) => {
+    set({ relations: get().relations.map((r) => (r.id === id ? { ...r, value } : r)) });
+    get().runSolve();
+  },
+
+  startEditRelationSide: (relationId, side) =>
+    set({ editingRelationSide: { relationId, side }, pickedEntities: [] }),
+
+  cancelEditRelationSide: () => set({ editingRelationSide: null }),
+
+  splitPart: (partId) => {
+    const state = get().parts.get(partId);
+    if (!state) return;
+    const result = splitPartMesh(state.part.mesh);
+    if (!result) return;
+
+    const basePos = new THREE.Vector3(...state.pose.position);
+    const baseQuat = new THREE.Quaternion(...state.pose.quaternion);
+
+    const parts = new Map(get().parts);
+    parts.delete(partId);
+    const partOrder = get().partOrder.filter((id) => id !== partId);
+
+    const newIds: string[] = [];
+    result.forEach(({ mesh, origin }, i) => {
+      const id = `${partId}-split${i + 1}`;
+      const worldOffset = new THREE.Vector3(...origin).applyQuaternion(baseQuat);
+      const position = basePos.clone().add(worldOffset).toArray() as Vec3;
+      const pose: Pose = { position, quaternion: [...state.pose.quaternion] };
+      parts.set(id, {
+        part: { id, name: `${state.part.name}.${i + 1}`, mesh, initialPose: pose },
+        pose,
+        fixed: state.fixed,
+        visible: true,
+        canSplit: false,
+      });
+      newIds.push(id);
+    });
+
+    set({
+      parts,
+      partOrder: [...partOrder, ...newIds],
+      relations: get().relations.filter((r) => r.a.partId !== partId && r.b.partId !== partId),
+      selectedPartId: null,
+      pickedEntities: [],
+    });
     get().runSolve();
   },
 

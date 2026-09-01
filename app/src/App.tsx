@@ -1,5 +1,6 @@
 import { Toolbar } from "./components/Toolbar";
 import { TreePanel } from "./components/TreePanel";
+import { InspectorPanel } from "./components/InspectorPanel";
 import { RelationsPanel } from "./components/RelationsPanel";
 import { StatusBar } from "./components/StatusBar";
 import { Viewport } from "./scene/Viewport";
@@ -15,8 +16,14 @@ export default function App() {
         <main className="min-w-0 flex-1">
           <Viewport />
         </main>
-        <aside className="w-72 shrink-0 border-l" style={{ borderColor: "var(--border)", background: "var(--bg-1)" }}>
-          <RelationsPanel />
+        <aside
+          className="flex w-72 shrink-0 flex-col border-l"
+          style={{ borderColor: "var(--border)", background: "var(--bg-1)" }}
+        >
+          <InspectorPanel />
+          <div className="min-h-0 flex-1">
+            <RelationsPanel />
+          </div>
         </aside>
       </div>
       <StatusBar />
