@@ -19,6 +19,17 @@ export interface PartState {
 export type ViewPreset = "iso" | "front" | "top" | "right";
 export type TransformMode = "translate" | "rotate";
 
+/** A snapshot of the assembly's data (not UI/selection state) for undo/redo. Safe as a
+ * shallow reference capture: every mutation in this store replaces `parts`/`partOrder`/
+ * `relations` with new containers rather than mutating them in place. */
+interface HistorySnapshot {
+  parts: Map<string, PartState>;
+  partOrder: string[];
+  relations: Relation[];
+}
+
+const MAX_HISTORY = 50;
+
 interface AssemblyStore {
   /** One entry per file imported so far (imports add to the assembly, they don't replace it). */
   fileNames: string[];
@@ -27,6 +38,8 @@ interface AssemblyStore {
   parts: Map<string, PartState>;
   partOrder: string[];
   relations: Relation[];
+  history: HistorySnapshot[];
+  future: HistorySnapshot[];
 
   selectedPartId: string | null;
   pickedEntities: EntityRef[];
@@ -62,6 +75,13 @@ interface AssemblyStore {
 
   splitPart: (partId: string) => void;
 
+  /** Records the current assembly data as an undo point — call right before a
+   * mutation you want undoable (skip this for continuous updates like a live
+   * drag; the caller pushes once per gesture instead). */
+  pushHistorySnapshot: () => void;
+  undo: () => void;
+  redo: () => void;
+
   runSolve: () => void;
 
   applicableRelationTypesForPicked: () => RelationType[];
@@ -76,6 +96,8 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
   parts: new Map(),
   partOrder: [],
   relations: [],
+  history: [],
+  future: [],
 
   selectedPartId: null,
   pickedEntities: [],
@@ -87,6 +109,7 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
   lastSolve: null,
 
   importAssembly: (assembly: ImportedAssembly) => {
+    get().pushHistorySnapshot();
     const importId = importCounter++;
     const parts = new Map(get().parts);
     const newIds: string[] = [];
@@ -112,7 +135,8 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
     });
   },
 
-  clearAssembly: () =>
+  clearAssembly: () => {
+    get().pushHistorySnapshot();
     set({
       fileNames: [],
       parts: new Map(),
@@ -121,13 +145,15 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
       selectedPartId: null,
       pickedEntities: [],
       lastSolve: null,
-    }),
+    });
+  },
 
   selectPart: (partId) => set({ selectedPartId: partId, pickedEntities: [] }),
 
   pickEntity: (ref) => {
     const editing = get().editingRelationSide;
     if (editing) {
+      get().pushHistorySnapshot();
       const relations = get().relations.map((r) =>
         r.id === editing.relationId ? { ...r, [editing.side]: ref } : r,
       );
@@ -157,17 +183,19 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
   },
 
   toggleFixed: (partId) => {
-    const parts = new Map(get().parts);
-    const entry = parts.get(partId);
+    const entry = get().parts.get(partId);
     if (!entry) return;
+    get().pushHistorySnapshot();
+    const parts = new Map(get().parts);
     parts.set(partId, { ...entry, fixed: !entry.fixed });
     set({ parts });
   },
 
   toggleVisible: (partId) => {
-    const parts = new Map(get().parts);
-    const entry = parts.get(partId);
+    const entry = get().parts.get(partId);
     if (!entry) return;
+    get().pushHistorySnapshot();
+    const parts = new Map(get().parts);
     parts.set(partId, { ...entry, visible: !entry.visible });
     set({ parts });
   },
@@ -179,22 +207,26 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
   addRelation: (type, value) => {
     const [a, b] = get().pickedEntities;
     if (!a || !b) return;
+    get().pushHistorySnapshot();
     const relation: Relation = { id: `rel-${relationCounter++}`, type, a, b, value };
     set({ relations: [...get().relations, relation], pickedEntities: [] });
     get().runSolve();
   },
 
   removeRelation: (id) => {
+    get().pushHistorySnapshot();
     set({ relations: get().relations.filter((r) => r.id !== id) });
     get().runSolve();
   },
 
   toggleRelationFlip: (id) => {
+    get().pushHistorySnapshot();
     set({ relations: get().relations.map((r) => (r.id === id ? { ...r, flip: !r.flip } : r)) });
     get().runSolve();
   },
 
   setRelationValue: (id, value) => {
+    get().pushHistorySnapshot();
     set({ relations: get().relations.map((r) => (r.id === id ? { ...r, value } : r)) });
     get().runSolve();
   },
@@ -209,6 +241,7 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
     if (!state) return;
     const result = splitPartMesh(state.part.mesh);
     if (!result) return;
+    get().pushHistorySnapshot();
 
     const basePos = new THREE.Vector3(...state.pose.position);
     const baseQuat = new THREE.Quaternion(...state.pose.quaternion);
@@ -268,6 +301,44 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
       parts: nextParts,
       isSolving: false,
       lastSolve: { residualNorm: result.residualNorm, converged: result.converged },
+    });
+  },
+
+  pushHistorySnapshot: () => {
+    const { parts, partOrder, relations, history } = get();
+    const trimmed = history.length >= MAX_HISTORY ? history.slice(history.length - MAX_HISTORY + 1) : history;
+    set({ history: [...trimmed, { parts, partOrder, relations }], future: [] });
+  },
+
+  undo: () => {
+    const { history, future, parts, partOrder, relations } = get();
+    const previous = history[history.length - 1];
+    if (!previous) return;
+    set({
+      parts: previous.parts,
+      partOrder: previous.partOrder,
+      relations: previous.relations,
+      history: history.slice(0, -1),
+      future: [...future, { parts, partOrder, relations }],
+      selectedPartId: null,
+      pickedEntities: [],
+      editingRelationSide: null,
+    });
+  },
+
+  redo: () => {
+    const { history, future, parts, partOrder, relations } = get();
+    const next = future[future.length - 1];
+    if (!next) return;
+    set({
+      parts: next.parts,
+      partOrder: next.partOrder,
+      relations: next.relations,
+      future: future.slice(0, -1),
+      history: [...history, { parts, partOrder, relations }],
+      selectedPartId: null,
+      pickedEntities: [],
+      editingRelationSide: null,
     });
   },
 
