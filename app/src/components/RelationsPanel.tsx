@@ -1,12 +1,42 @@
 import { useState } from "react";
 import { useAssemblyStore } from "../assembly/store";
-import { RELATION_LABELS, type RelationType } from "../assembly/relations";
+import { RELATION_LABELS, type Relation, type RelationType } from "../assembly/relations";
 import type { EntityRef } from "../occ/types";
 
 const NEEDS_VALUE: Partial<Record<RelationType, boolean>> = { distance: true, planar: true };
 
 function entityLabel(ref: EntityRef, partName: string | undefined): string {
   return `${partName ?? "?"} · ${ref.kind === "face" ? "cara" : "arista"} #${ref.id}`;
+}
+
+function RelationSideRow({
+  rel,
+  side,
+  parts,
+}: {
+  rel: Relation;
+  side: "a" | "b";
+  parts: ReturnType<typeof useAssemblyStore.getState>["parts"];
+}) {
+  const startEditRelationSide = useAssemblyStore((s) => s.startEditRelationSide);
+  const editingRelationSide = useAssemblyStore((s) => s.editingRelationSide);
+  const ref = rel[side];
+  const isEditingThis = editingRelationSide?.relationId === rel.id && editingRelationSide.side === side;
+  return (
+    <div className="flex items-center justify-between gap-2">
+      <span className="truncate" style={{ color: "var(--text-dim)" }}>
+        {entityLabel(ref, parts.get(ref.partId)?.part.name)}
+      </span>
+      <button
+        title={`Cambiar la cara/arista ${side.toUpperCase()}`}
+        onClick={() => startEditRelationSide(rel.id, side)}
+        className="shrink-0 rounded px-1 text-[11px] hover:opacity-80"
+        style={{ color: isEditingThis ? "var(--warn)" : "var(--text-dim)" }}
+      >
+        {isEditingThis ? "…esperando clic" : "✎ cambiar"}
+      </button>
+    </div>
+  );
 }
 
 export function RelationsPanel() {
@@ -17,6 +47,10 @@ export function RelationsPanel() {
   const applicableRelationTypesForPicked = useAssemblyStore((s) => s.applicableRelationTypesForPicked);
   const relations = useAssemblyStore((s) => s.relations);
   const removeRelation = useAssemblyStore((s) => s.removeRelation);
+  const toggleRelationFlip = useAssemblyStore((s) => s.toggleRelationFlip);
+  const setRelationValue = useAssemblyStore((s) => s.setRelationValue);
+  const editingRelationSide = useAssemblyStore((s) => s.editingRelationSide);
+  const cancelEditRelationSide = useAssemblyStore((s) => s.cancelEditRelationSide);
   const isSolving = useAssemblyStore((s) => s.isSolving);
   const lastSolve = useAssemblyStore((s) => s.lastSolve);
 
@@ -34,9 +68,18 @@ export function RelationsPanel() {
       </div>
 
       <div className="border-b px-3 py-3" style={{ borderColor: "var(--border)" }}>
-        <div className="mb-2 text-[11px]" style={{ color: "var(--text-dim)" }}>
-          Selección {pickedEntities.length}/2 — clic en dos caras o aristas de piezas distintas.
-        </div>
+        {editingRelationSide ? (
+          <div className="mb-2 flex items-center justify-between gap-2 text-[11px]" style={{ color: "var(--warn)" }}>
+            <span>Clic en una nueva cara/arista para reemplazar el lado {editingRelationSide.side.toUpperCase()}.</span>
+            <button onClick={cancelEditRelationSide} className="underline" style={{ color: "var(--text-dim)" }}>
+              Cancelar
+            </button>
+          </div>
+        ) : (
+          <div className="mb-2 text-[11px]" style={{ color: "var(--text-dim)" }}>
+            Selección {pickedEntities.length}/2 — clic en dos caras o aristas de piezas distintas.
+          </div>
+        )}
         <div className="mb-2 flex flex-col gap-1">
           {pickedEntities.map((ref, i) => (
             <div
@@ -95,8 +138,8 @@ export function RelationsPanel() {
           </div>
         )}
         {relations.map((rel) => (
-          <div key={rel.id} className="border-b px-3 py-2 text-[11px]" style={{ borderColor: "var(--border)" }}>
-            <div className="mb-1 flex items-center justify-between">
+          <div key={rel.id} className="flex flex-col gap-1 border-b px-3 py-2 text-[11px]" style={{ borderColor: "var(--border)" }}>
+            <div className="flex items-center justify-between">
               <span className="font-medium" style={{ color: "var(--text-bright)" }}>
                 {RELATION_LABELS[rel.type]}
               </span>
@@ -104,8 +147,31 @@ export function RelationsPanel() {
                 Eliminar
               </button>
             </div>
-            <div style={{ color: "var(--text-dim)" }}>{entityLabel(rel.a, parts.get(rel.a.partId)?.part.name)}</div>
-            <div style={{ color: "var(--text-dim)" }}>{entityLabel(rel.b, parts.get(rel.b.partId)?.part.name)}</div>
+            <RelationSideRow rel={rel} side="a" parts={parts} />
+            <RelationSideRow rel={rel} side="b" parts={parts} />
+            <div className="mt-1 flex flex-wrap items-center gap-3">
+              {rel.type === "planar" && (
+                <button
+                  onClick={() => toggleRelationFlip(rel.id)}
+                  className="rounded border px-1.5 py-0.5 text-[11px]"
+                  style={{ borderColor: "var(--border-strong)", color: "var(--text-dim)" }}
+                >
+                  {rel.flip ? "↺ mismo sentido" : "↺ invertir sentido"}
+                </button>
+              )}
+              {NEEDS_VALUE[rel.type] && (
+                <label className="flex items-center gap-1.5" style={{ color: "var(--text-dim)" }}>
+                  Offset (mm)
+                  <input
+                    type="number"
+                    value={rel.value}
+                    onChange={(e) => setRelationValue(rel.id, Number(e.target.value))}
+                    className="w-16 rounded border px-1 py-0.5"
+                    style={{ borderColor: "var(--border-strong)", background: "var(--bg-2)", color: "var(--text)" }}
+                  />
+                </label>
+              )}
+            </div>
           </div>
         ))}
       </div>

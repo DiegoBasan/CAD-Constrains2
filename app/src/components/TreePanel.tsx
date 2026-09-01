@@ -8,6 +8,7 @@ export function TreePanel() {
   const selectPart = useAssemblyStore((s) => s.selectPart);
   const toggleFixed = useAssemblyStore((s) => s.toggleFixed);
   const toggleVisible = useAssemblyStore((s) => s.toggleVisible);
+  const splitPart = useAssemblyStore((s) => s.splitPart);
 
   return (
     <div className="flex h-full flex-col">
@@ -40,21 +41,32 @@ export function TreePanel() {
             >
               <span className="h-2.5 w-2.5 shrink-0 rounded-sm" style={{ background: color }} />
               <span className="flex-1 truncate">{state.part.name}</span>
-              {state.fixed && (
-                <span title="Fija" className="text-[10px]" style={{ color: "var(--warn)" }}>
-                  🔒
-                </span>
+              {state.canSplit && (
+                <button
+                  title="Esta pieza tiene varios cuerpos desconectados — separar en piezas independientes"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    splitPart(id);
+                  }}
+                  className="shrink-0 rounded px-1 text-[11px] hover:opacity-80"
+                  style={{ color: "var(--text-dim)" }}
+                >
+                  ✂
+                </button>
               )}
               <button
-                title={state.fixed ? "Liberar pieza" : "Fijar pieza"}
+                title={state.fixed ? "Pieza fija — clic para liberarla" : "Pieza libre — clic para fijarla"}
                 onClick={(e) => {
                   e.stopPropagation();
                   toggleFixed(id);
                 }}
-                className="rounded px-1 text-[11px] hover:opacity-80"
-                style={{ color: "var(--text-dim)" }}
+                className="rounded px-1.5 py-0.5 text-[12px] hover:opacity-80"
+                style={{
+                  background: state.fixed ? "var(--accent-bg)" : "transparent",
+                  color: state.fixed ? "var(--warn)" : "var(--text-dim)",
+                }}
               >
-                {state.fixed ? "Fijo" : "Libre"}
+                {state.fixed ? "🔒" : "🔓"}
               </button>
               <button
                 title={state.visible ? "Ocultar" : "Mostrar"}

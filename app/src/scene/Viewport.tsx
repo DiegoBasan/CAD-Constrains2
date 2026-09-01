@@ -1,10 +1,10 @@
 import { useEffect, useRef } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
-import { TransformControls } from "three/examples/jsm/controls/TransformControls.js";
 import { useAssemblyStore } from "../assembly/store";
 import type { ImportedPart } from "../occ/types";
 import { EDGE_COLOR, EDGE_HIGHLIGHT_COLOR, PICK_COLOR, SELECTED_PART_COLOR, partColor } from "./colors";
+import { Gizmo } from "./gizmo";
 import { applyViewPreset } from "./viewPresets";
 
 interface PartVisual {
@@ -91,10 +91,10 @@ export function Viewport() {
   const cameraRef = useRef<THREE.OrthographicCamera | null>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const orbitRef = useRef<OrbitControls | null>(null);
-  const transformRef = useRef<TransformControls | null>(null);
+  const gizmoRef = useRef<Gizmo | null>(null);
   const visualsRef = useRef<Map<string, PartVisual>>(new Map());
   const pointerDownRef = useRef<{ x: number; y: number } | null>(null);
-  const gizmoEngagedRef = useRef(false);
+  const draggingGizmoRef = useRef(false);
   const viewSizeRef = useRef(200);
 
   const parts = useAssemblyStore((s) => s.parts);
@@ -151,28 +151,15 @@ export function Viewport() {
     applyViewPreset(camera, target, "iso", 300);
     orbit.update();
 
-    const transform = new TransformControls(camera, renderer.domElement);
-    transform.setSize(0.9);
-    scene.add(transform.getHelper());
-    transformRef.current = transform;
-    transform.addEventListener("dragging-changed", (event) => {
-      orbit.enabled = !event.value;
-      if (!event.value) useAssemblyStore.getState().runSolve();
-    });
-    transform.addEventListener("objectChange", () => {
-      const obj = transform.object;
-      if (!obj) return;
-      useAssemblyStore.getState().setPose(obj.name, {
-        position: [obj.position.x, obj.position.y, obj.position.z],
-        quaternion: [obj.quaternion.x, obj.quaternion.y, obj.quaternion.z, obj.quaternion.w],
-      });
-    });
+    const gizmo = new Gizmo();
+    scene.add(gizmo.object);
+    gizmoRef.current = gizmo;
 
     const raycaster = new THREE.Raycaster();
 
-    function pick(clientX: number, clientY: number) {
+    function raycasterFromEvent(clientX: number, clientY: number): THREE.Raycaster | null {
       const el = containerRef.current;
-      if (!el) return;
+      if (!el) return null;
       const rect = el.getBoundingClientRect();
       const ndc = new THREE.Vector2(
         ((clientX - rect.left) / rect.width) * 2 - 1,
@@ -181,11 +168,17 @@ export function Viewport() {
       raycaster.setFromCamera(ndc, camera);
       const frustumWidth = (camera.right - camera.left) / camera.zoom;
       raycaster.params.Line = { threshold: (frustumWidth / rect.width) * 6 };
+      return raycaster;
+    }
+
+    function pick(clientX: number, clientY: number) {
+      const rc = raycasterFromEvent(clientX, clientY);
+      if (!rc) return;
 
       const { parts: currentParts, pickEntity, selectPart } = useAssemblyStore.getState();
       const visuals = Array.from(visualsRef.current.values());
 
-      const lineHits = raycaster.intersectObjects(visuals.map((v) => v.edgeLines), false);
+      const lineHits = rc.intersectObjects(visuals.map((v) => v.edgeLines), false);
       if (lineHits.length > 0) {
         const hit = lineHits[0];
         const partId = hit.object.userData.partId as string;
@@ -197,7 +190,7 @@ export function Viewport() {
         }
       }
 
-      const faceHits = raycaster.intersectObjects(visuals.map((v) => v.mesh), false);
+      const faceHits = rc.intersectObjects(visuals.map((v) => v.mesh), false);
       if (faceHits.length > 0) {
         const hit = faceHits[0];
         const partId = hit.object.userData.partId as string;
@@ -212,18 +205,41 @@ export function Viewport() {
 
     function onPointerDown(e: PointerEvent) {
       pointerDownRef.current = { x: e.clientX, y: e.clientY };
-      // TransformControls' own pointerdown handler (registered before ours, on the
-      // same element) already ran by now and set `dragging` if a gizmo handle was
-      // hit — capture that here. We can't reliably re-read `transform.dragging` at
-      // pointerup time: its own pointerup handler (also registered before ours)
-      // flips it back to false before our handler runs, so checking it there raced
-      // and made every gizmo drag end with a spurious re-pick.
-      gizmoEngagedRef.current = transform.dragging;
+      const rc = raycasterFromEvent(e.clientX, e.clientY);
+      if (rc && gizmo.beginDrag(rc, camera)) {
+        draggingGizmoRef.current = true;
+        orbit.enabled = false;
+      }
+    }
+    function onPointerMove(e: PointerEvent) {
+      const rc = raycasterFromEvent(e.clientX, e.clientY);
+      if (!rc) return;
+      if (draggingGizmoRef.current) {
+        const result = gizmo.updateDrag(rc);
+        if (!result) return;
+        const selectedPartId = useAssemblyStore.getState().selectedPartId;
+        if (!selectedPartId) return;
+        const visual = visualsRef.current.get(selectedPartId);
+        if (visual) {
+          visual.group.position.copy(result.position);
+          visual.group.quaternion.copy(result.quaternion);
+        }
+        useAssemblyStore.getState().setPose(selectedPartId, {
+          position: [result.position.x, result.position.y, result.position.z],
+          quaternion: [result.quaternion.x, result.quaternion.y, result.quaternion.z, result.quaternion.w],
+        });
+        return;
+      }
+      gizmo.hoverTest(rc);
     }
     function onPointerUp(e: PointerEvent) {
-      const wasGizmo = gizmoEngagedRef.current;
-      gizmoEngagedRef.current = false;
-      if (wasGizmo) return;
+      if (draggingGizmoRef.current) {
+        draggingGizmoRef.current = false;
+        gizmo.endDrag();
+        orbit.enabled = true;
+        useAssemblyStore.getState().runSolve();
+        return;
+      }
       const start = pointerDownRef.current;
       pointerDownRef.current = null;
       if (!start) return;
@@ -234,6 +250,7 @@ export function Viewport() {
     let raf = 0;
     const animate = () => {
       orbit.update();
+      gizmo.syncToTarget(camera, renderer.domElement.clientHeight);
       renderer.render(scene, camera);
       raf = requestAnimationFrame(animate);
     };
@@ -258,14 +275,16 @@ export function Viewport() {
 
     const dom = renderer.domElement;
     dom.addEventListener("pointerdown", onPointerDown);
+    dom.addEventListener("pointermove", onPointerMove);
     dom.addEventListener("pointerup", onPointerUp);
 
     return () => {
       cancelAnimationFrame(raf);
       resizeObserver.disconnect();
       dom.removeEventListener("pointerdown", onPointerDown);
+      dom.removeEventListener("pointermove", onPointerMove);
       dom.removeEventListener("pointerup", onPointerUp);
-      transform.dispose();
+      gizmo.dispose();
       orbit.dispose();
       renderer.dispose();
       container.removeChild(renderer.domElement);
@@ -273,7 +292,7 @@ export function Viewport() {
       cameraRef.current = null;
       rendererRef.current = null;
       orbitRef.current = null;
-      transformRef.current = null;
+      gizmoRef.current = null;
     };
   }, []);
 
@@ -332,18 +351,18 @@ export function Viewport() {
     });
   }, [parts, partOrder, selectedPartId, pickedEntities]);
 
-  // --- transform gizmo attach/detach ---
+  // --- gizmo attach/detach ---
   useEffect(() => {
-    const transform = transformRef.current;
-    if (!transform) return;
-    transform.setMode(transformMode);
+    const gizmo = gizmoRef.current;
+    if (!gizmo) return;
+    gizmo.setMode(transformMode);
     const state = selectedPartId ? parts.get(selectedPartId) : undefined;
     const visual = selectedPartId ? visualsRef.current.get(selectedPartId) : undefined;
     if (!state || !visual || state.fixed) {
-      transform.detach();
+      gizmo.attach(null);
       return;
     }
-    transform.attach(visual.group);
+    gizmo.attach(visual.group);
   }, [selectedPartId, transformMode, parts]);
 
   // --- view preset requests ---
