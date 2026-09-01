@@ -4,7 +4,6 @@ import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { useAssemblyStore } from "../assembly/store";
 import type { ImportedPart } from "../occ/types";
 import { EDGE_COLOR, EDGE_HIGHLIGHT_COLOR, PICK_COLOR, SELECTED_PART_COLOR, partColor } from "./colors";
-import { Gizmo } from "./gizmo";
 import { applyViewPreset } from "./viewPresets";
 
 interface PartVisual {
@@ -15,6 +14,32 @@ interface PartVisual {
   edgeLines: THREE.LineSegments;
   highlightMesh: THREE.Mesh | null;
 }
+
+/** An in-progress direct-manipulation drag on the selected part's body — free (not
+ * axis-constrained) translate in the camera's view plane, or free spin about the
+ * view axis for rotate. Armed on pointerdown over the part; only becomes an actual
+ * drag once the pointer moves past the click threshold, so a plain tap still falls
+ * through to face/edge picking. */
+type ArmedDrag =
+  | {
+      kind: "translate";
+      partId: string;
+      dragging: boolean;
+      plane: THREE.Plane;
+      startPoint: THREE.Vector3;
+      startPosition: THREE.Vector3;
+      startQuaternion: THREE.Quaternion;
+    }
+  | {
+      kind: "rotate";
+      partId: string;
+      dragging: boolean;
+      centerScreen: THREE.Vector2;
+      startAngle: number;
+      viewAxis: THREE.Vector3;
+      startPosition: THREE.Vector3;
+      startQuaternion: THREE.Quaternion;
+    };
 
 function buildPartVisual(part: ImportedPart, color: number): PartVisual {
   const group = new THREE.Group();
@@ -91,17 +116,15 @@ export function Viewport() {
   const cameraRef = useRef<THREE.OrthographicCamera | null>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const orbitRef = useRef<OrbitControls | null>(null);
-  const gizmoRef = useRef<Gizmo | null>(null);
   const visualsRef = useRef<Map<string, PartVisual>>(new Map());
   const pointerDownRef = useRef<{ x: number; y: number } | null>(null);
-  const draggingGizmoRef = useRef(false);
+  const armedDragRef = useRef<ArmedDrag | null>(null);
   const viewSizeRef = useRef(200);
 
   const parts = useAssemblyStore((s) => s.parts);
   const partOrder = useAssemblyStore((s) => s.partOrder);
   const selectedPartId = useAssemblyStore((s) => s.selectedPartId);
   const pickedEntities = useAssemblyStore((s) => s.pickedEntities);
-  const transformMode = useAssemblyStore((s) => s.transformMode);
   const requestedView = useAssemblyStore((s) => s.requestedView);
   const consumeRequestedView = useAssemblyStore((s) => s.consumeRequestedView);
   const importVersion = useAssemblyStore((s) => s.importVersion);
@@ -151,11 +174,8 @@ export function Viewport() {
     applyViewPreset(camera, target, "iso", 300);
     orbit.update();
 
-    const gizmo = new Gizmo();
-    scene.add(gizmo.object);
-    gizmoRef.current = gizmo;
-
     const raycaster = new THREE.Raycaster();
+    const dom = renderer.domElement;
 
     function raycasterFromEvent(clientX: number, clientY: number): THREE.Raycaster | null {
       const el = containerRef.current;
@@ -205,40 +225,125 @@ export function Viewport() {
 
     function onPointerDown(e: PointerEvent) {
       pointerDownRef.current = { x: e.clientX, y: e.clientY };
+      armedDragRef.current = null;
+
+      const { selectedPartId: selId, parts: currentParts, transformMode } = useAssemblyStore.getState();
+      if (!selId) return;
+      const state = currentParts.get(selId);
+      const visual = visualsRef.current.get(selId);
+      if (!state || !visual || state.fixed) return;
       const rc = raycasterFromEvent(e.clientX, e.clientY);
-      if (rc && gizmo.beginDrag(rc, camera)) {
-        draggingGizmoRef.current = true;
-        orbit.enabled = false;
+      if (!rc || rc.intersectObject(visual.mesh, false).length === 0) return;
+
+      // Might turn out to be just a tap (handled as a pick on pointerup) — disabling
+      // orbit now regardless is harmless since nothing would have orbited from a
+      // non-moving click anyway, and it avoids a one-frame camera flash if it does
+      // turn into a drag.
+      orbit.enabled = false;
+
+      if (transformMode === "translate") {
+        const viewDir = new THREE.Vector3();
+        camera.getWorldDirection(viewDir);
+        const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(viewDir, visual.group.position);
+        const startPoint = new THREE.Vector3();
+        if (!rc.ray.intersectPlane(plane, startPoint)) return;
+        armedDragRef.current = {
+          kind: "translate",
+          partId: selId,
+          dragging: false,
+          plane,
+          startPoint,
+          startPosition: visual.group.position.clone(),
+          startQuaternion: visual.group.quaternion.clone(),
+        };
+      } else {
+        const rect = containerRef.current!.getBoundingClientRect();
+        const centerNdc = visual.group.position.clone().project(camera);
+        const centerScreen = new THREE.Vector2(
+          ((centerNdc.x + 1) / 2) * rect.width,
+          ((1 - centerNdc.y) / 2) * rect.height,
+        );
+        const mouseScreen = new THREE.Vector2(e.clientX - rect.left, e.clientY - rect.top);
+        const startAngle = Math.atan2(mouseScreen.y - centerScreen.y, mouseScreen.x - centerScreen.x);
+        const viewAxis = new THREE.Vector3();
+        camera.getWorldDirection(viewAxis);
+        armedDragRef.current = {
+          kind: "rotate",
+          partId: selId,
+          dragging: false,
+          centerScreen,
+          startAngle,
+          viewAxis,
+          startPosition: visual.group.position.clone(),
+          startQuaternion: visual.group.quaternion.clone(),
+        };
       }
     }
+
     function onPointerMove(e: PointerEvent) {
+      const armed = armedDragRef.current;
+      if (!armed) {
+        // Cursor affordance: "grab" over the draggable selected part, default elsewhere.
+        const selId = useAssemblyStore.getState().selectedPartId;
+        const visual = selId ? visualsRef.current.get(selId) : undefined;
+        if (visual) {
+          const rc = raycasterFromEvent(e.clientX, e.clientY);
+          dom.style.cursor = rc && rc.intersectObject(visual.mesh, false).length > 0 ? "grab" : "";
+        } else {
+          dom.style.cursor = "";
+        }
+        return;
+      }
+
+      if (!armed.dragging) {
+        const start = pointerDownRef.current;
+        if (!start || Math.hypot(e.clientX - start.x, e.clientY - start.y) <= 4) return;
+        armed.dragging = true;
+        useAssemblyStore.getState().pushHistorySnapshot();
+        dom.style.cursor = "grabbing";
+      }
+
       const rc = raycasterFromEvent(e.clientX, e.clientY);
       if (!rc) return;
-      if (draggingGizmoRef.current) {
-        const result = gizmo.updateDrag(rc);
-        if (!result) return;
-        const selectedPartId = useAssemblyStore.getState().selectedPartId;
-        if (!selectedPartId) return;
-        const visual = visualsRef.current.get(selectedPartId);
-        if (visual) {
-          visual.group.position.copy(result.position);
-          visual.group.quaternion.copy(result.quaternion);
-        }
-        useAssemblyStore.getState().setPose(selectedPartId, {
-          position: [result.position.x, result.position.y, result.position.z],
-          quaternion: [result.quaternion.x, result.quaternion.y, result.quaternion.z, result.quaternion.w],
-        });
-        return;
+      const visual = visualsRef.current.get(armed.partId);
+      if (!visual) return;
+
+      let position: THREE.Vector3;
+      let quaternion: THREE.Quaternion;
+      if (armed.kind === "translate") {
+        const hit = new THREE.Vector3();
+        if (!rc.ray.intersectPlane(armed.plane, hit)) return;
+        position = armed.startPosition.clone().add(hit.sub(armed.startPoint));
+        quaternion = armed.startQuaternion.clone();
+      } else {
+        const rect = containerRef.current!.getBoundingClientRect();
+        const mouseScreen = new THREE.Vector2(e.clientX - rect.left, e.clientY - rect.top);
+        const angle = Math.atan2(mouseScreen.y - armed.centerScreen.y, mouseScreen.x - armed.centerScreen.x);
+        const delta = angle - armed.startAngle;
+        const deltaQuat = new THREE.Quaternion().setFromAxisAngle(armed.viewAxis, delta);
+        quaternion = deltaQuat.multiply(armed.startQuaternion.clone());
+        position = armed.startPosition.clone();
       }
-      gizmo.hoverTest(rc);
+
+      visual.group.position.copy(position);
+      visual.group.quaternion.copy(quaternion);
+      useAssemblyStore.getState().setPose(armed.partId, {
+        position: [position.x, position.y, position.z],
+        quaternion: [quaternion.x, quaternion.y, quaternion.z, quaternion.w],
+      });
     }
+
     function onPointerUp(e: PointerEvent) {
-      if (draggingGizmoRef.current) {
-        draggingGizmoRef.current = false;
-        gizmo.endDrag();
+      const armed = armedDragRef.current;
+      armedDragRef.current = null;
+      if (armed) {
         orbit.enabled = true;
-        useAssemblyStore.getState().runSolve();
-        return;
+        dom.style.cursor = "";
+        if (armed.dragging) {
+          useAssemblyStore.getState().runSolve();
+          return;
+        }
+        // Armed but never crossed the drag threshold — treat as a plain click below.
       }
       const start = pointerDownRef.current;
       pointerDownRef.current = null;
@@ -250,7 +355,6 @@ export function Viewport() {
     let raf = 0;
     const animate = () => {
       orbit.update();
-      gizmo.syncToTarget(camera, renderer.domElement.clientHeight);
       renderer.render(scene, camera);
       raf = requestAnimationFrame(animate);
     };
@@ -273,7 +377,6 @@ export function Viewport() {
     });
     resizeObserver.observe(container);
 
-    const dom = renderer.domElement;
     dom.addEventListener("pointerdown", onPointerDown);
     dom.addEventListener("pointermove", onPointerMove);
     dom.addEventListener("pointerup", onPointerUp);
@@ -284,7 +387,6 @@ export function Viewport() {
       dom.removeEventListener("pointerdown", onPointerDown);
       dom.removeEventListener("pointermove", onPointerMove);
       dom.removeEventListener("pointerup", onPointerUp);
-      gizmo.dispose();
       orbit.dispose();
       renderer.dispose();
       container.removeChild(renderer.domElement);
@@ -292,7 +394,6 @@ export function Viewport() {
       cameraRef.current = null;
       rendererRef.current = null;
       orbitRef.current = null;
-      gizmoRef.current = null;
     };
   }, []);
 
@@ -350,20 +451,6 @@ export function Viewport() {
       updateEdgeHighlight(visual, state.part, pickedEdge?.id ?? null);
     });
   }, [parts, partOrder, selectedPartId, pickedEntities]);
-
-  // --- gizmo attach/detach ---
-  useEffect(() => {
-    const gizmo = gizmoRef.current;
-    if (!gizmo) return;
-    gizmo.setMode(transformMode);
-    const state = selectedPartId ? parts.get(selectedPartId) : undefined;
-    const visual = selectedPartId ? visualsRef.current.get(selectedPartId) : undefined;
-    if (!state || !visual || state.fixed) {
-      gizmo.attach(null);
-      return;
-    }
-    gizmo.attach(visual.group);
-  }, [selectedPartId, transformMode, parts]);
 
   // --- view preset requests ---
   useEffect(() => {

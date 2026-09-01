@@ -1,11 +1,31 @@
+import { useEffect } from "react";
 import { Toolbar } from "./components/Toolbar";
 import { TreePanel } from "./components/TreePanel";
 import { InspectorPanel } from "./components/InspectorPanel";
 import { RelationsPanel } from "./components/RelationsPanel";
 import { StatusBar } from "./components/StatusBar";
 import { Viewport } from "./scene/Viewport";
+import { useAssemblyStore } from "./assembly/store";
+
+function isTextInput(el: EventTarget | null): boolean {
+  if (!(el instanceof HTMLElement)) return false;
+  return el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable;
+}
 
 export default function App() {
+  useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      if (!(e.ctrlKey || e.metaKey) || e.key.toLowerCase() !== "z") return;
+      if (isTextInput(e.target)) return;
+      e.preventDefault();
+      const store = useAssemblyStore.getState();
+      if (e.altKey) store.redo();
+      else store.undo();
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
   return (
     <div className="flex h-screen w-screen flex-col" style={{ background: "var(--bg-0)" }}>
       <Toolbar />

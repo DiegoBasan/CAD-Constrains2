@@ -30,6 +30,7 @@ export function InspectorPanel() {
   const parts = useAssemblyStore((s) => s.parts);
   const setPose = useAssemblyStore((s) => s.setPose);
   const runSolve = useAssemblyStore((s) => s.runSolve);
+  const pushHistorySnapshot = useAssemblyStore((s) => s.pushHistorySnapshot);
 
   if (!selectedPartId) return null;
   const state = parts.get(selectedPartId);
@@ -43,6 +44,7 @@ export function InspectorPanel() {
   const rz = THREE.MathUtils.radToDeg(euler.z);
 
   function commitPosition(axis: 0 | 1 | 2, v: number) {
+    pushHistorySnapshot();
     const position = [...state!.pose.position] as Vec3;
     position[axis] = v;
     setPose(selectedPartId!, { position, quaternion: state!.pose.quaternion });
@@ -50,6 +52,7 @@ export function InspectorPanel() {
   }
 
   function commitRotationDeg(axis: "x" | "y" | "z", deg: number) {
+    pushHistorySnapshot();
     const e = new THREE.Euler().setFromQuaternion(new THREE.Quaternion(...state!.pose.quaternion), "XYZ");
     e[axis] = THREE.MathUtils.degToRad(deg);
     const q = new THREE.Quaternion().setFromEuler(e);
