@@ -10,15 +10,12 @@
   --text: #d5d8e0;
   --text-dim: #8891a3;
   --text-bright: #f3f5f9;
-  --accent: #4fa3ff;
-  --accent-dim: #2c5f96;
-  --accent-bg: rgba(79, 163, 255, 0.12);
+  --accent: #d7dae0;
+  --accent-dim: #6b7180;
+  --accent-bg: rgba(215, 218, 224, 0.12);
   --ok: #3ecf8e;
   --warn: #f2b84b;
   --danger: #ef5b5b;
-  --axis-x: #e5484d;
-  --axis-y: #3ecf8e;
-  --axis-z: #4fa3ff;
   color-scheme: dark;
 }
 
