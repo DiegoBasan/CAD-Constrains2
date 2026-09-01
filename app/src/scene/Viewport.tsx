@@ -4,13 +4,14 @@ import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { TransformControls } from "three/examples/jsm/controls/TransformControls.js";
 import { useAssemblyStore } from "../assembly/store";
 import type { ImportedPart } from "../occ/types";
-import { EDGE_COLOR, EDGE_HIGHLIGHT_COLOR, PICK_COLOR, partColor } from "./colors";
+import { EDGE_COLOR, EDGE_HIGHLIGHT_COLOR, PICK_COLOR, SELECTED_PART_COLOR, partColor } from "./colors";
 import { applyViewPreset } from "./viewPresets";
 
 interface PartVisual {
   group: THREE.Group;
   mesh: THREE.Mesh;
   material: THREE.MeshStandardMaterial;
+  baseColor: number;
   edgeLines: THREE.LineSegments;
   highlightMesh: THREE.Mesh | null;
 }
@@ -45,7 +46,7 @@ function buildPartVisual(part: ImportedPart, color: number): PartVisual {
   edgeLines.userData.partId = part.id;
   group.add(edgeLines);
 
-  return { group, mesh, material, edgeLines, highlightMesh: null };
+  return { group, mesh, material, baseColor: color, edgeLines, highlightMesh: null };
 }
 
 function buildFaceHighlight(part: ImportedPart, faceId: number): THREE.Mesh | null {
@@ -93,6 +94,7 @@ export function Viewport() {
   const transformRef = useRef<TransformControls | null>(null);
   const visualsRef = useRef<Map<string, PartVisual>>(new Map());
   const pointerDownRef = useRef<{ x: number; y: number } | null>(null);
+  const gizmoEngagedRef = useRef(false);
   const viewSizeRef = useRef(200);
 
   const parts = useAssemblyStore((s) => s.parts);
@@ -102,7 +104,7 @@ export function Viewport() {
   const transformMode = useAssemblyStore((s) => s.transformMode);
   const requestedView = useAssemblyStore((s) => s.requestedView);
   const consumeRequestedView = useAssemblyStore((s) => s.consumeRequestedView);
-  const fileName = useAssemblyStore((s) => s.fileName);
+  const importVersion = useAssemblyStore((s) => s.importVersion);
 
   // --- one-time scene setup ---
   useEffect(() => {
@@ -210,9 +212,18 @@ export function Viewport() {
 
     function onPointerDown(e: PointerEvent) {
       pointerDownRef.current = { x: e.clientX, y: e.clientY };
+      // TransformControls' own pointerdown handler (registered before ours, on the
+      // same element) already ran by now and set `dragging` if a gizmo handle was
+      // hit — capture that here. We can't reliably re-read `transform.dragging` at
+      // pointerup time: its own pointerup handler (also registered before ours)
+      // flips it back to false before our handler runs, so checking it there raced
+      // and made every gizmo drag end with a spurious re-pick.
+      gizmoEngagedRef.current = transform.dragging;
     }
     function onPointerUp(e: PointerEvent) {
-      if (transform.dragging) return;
+      const wasGizmo = gizmoEngagedRef.current;
+      gizmoEngagedRef.current = false;
+      if (wasGizmo) return;
       const start = pointerDownRef.current;
       pointerDownRef.current = null;
       if (!start) return;
@@ -299,8 +310,7 @@ export function Viewport() {
       visual.group.position.set(...state.pose.position);
       visual.group.quaternion.set(...state.pose.quaternion);
       visual.group.visible = state.visible;
-      visual.material.emissive.setHex(id === selectedPartId ? 0x27314d : 0x000000);
-      visual.material.opacity = state.fixed ? 1 : 1;
+      visual.material.color.setHex(id === selectedPartId ? SELECTED_PART_COLOR : visual.baseColor);
 
       if (visual.highlightMesh) {
         visual.group.remove(visual.highlightMesh);
@@ -350,7 +360,7 @@ export function Viewport() {
 
   // --- frame the whole assembly after a fresh import ---
   useEffect(() => {
-    if (!fileName) return;
+    if (importVersion === 0) return;
     const raf = requestAnimationFrame(() => {
       const camera = cameraRef.current;
       const orbit = orbitRef.current;
@@ -374,7 +384,7 @@ export function Viewport() {
       orbit.update();
     });
     return () => cancelAnimationFrame(raf);
-  }, [fileName]);
+  }, [importVersion]);
 
   return <div ref={containerRef} className="h-full w-full" />;
 }

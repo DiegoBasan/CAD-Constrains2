@@ -8,7 +8,10 @@ export function partColor(index: number): number {
   return PALETTE[index % PALETTE.length];
 }
 
-export const HIGHLIGHT_COLOR = 0xff9d2f;
+/** The whole body of the selected part switches to this neutral gray, so it's
+ * obvious which part is selected regardless of its normal palette color. */
+export const SELECTED_PART_COLOR = 0x9aa1ac;
+/** Picked face/edge overlay — stays blue on top of the gray selected part. */
 export const PICK_COLOR = 0x4fa3ff;
 export const EDGE_COLOR = 0x0d0f14;
-export const EDGE_HIGHLIGHT_COLOR = 0xff9d2f;
+export const EDGE_HIGHLIGHT_COLOR = 0x4fa3ff;

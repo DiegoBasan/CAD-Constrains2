@@ -41,7 +41,7 @@ export function Toolbar() {
   const requestView = useAssemblyStore((s) => s.requestView);
   const transformMode = useAssemblyStore((s) => s.transformMode);
   const setTransformMode = useAssemblyStore((s) => s.setTransformMode);
-  const fileName = useAssemblyStore((s) => s.fileName);
+  const fileNames = useAssemblyStore((s) => s.fileNames);
   const partCount = useAssemblyStore((s) => s.partOrder.length);
 
   return (
@@ -74,9 +74,10 @@ export function Toolbar() {
       </div>
 
       <div className="ml-auto flex items-center gap-2 text-[11px]" style={{ color: "var(--text-dim)" }}>
-        {fileName && (
+        {fileNames.length > 0 && (
           <span>
-            {fileName} · {partCount} pieza{partCount === 1 ? "" : "s"}
+            {fileNames.length === 1 ? fileNames[0] : `${fileNames.length} archivos`} · {partCount} pieza
+            {partCount === 1 ? "" : "s"}
           </span>
         )}
       </div>

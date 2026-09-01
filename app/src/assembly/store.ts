@@ -14,7 +14,10 @@ export type ViewPreset = "iso" | "front" | "top" | "right";
 export type TransformMode = "translate" | "rotate";
 
 interface AssemblyStore {
-  fileName: string | null;
+  /** One entry per file imported so far (imports add to the assembly, they don't replace it). */
+  fileNames: string[];
+  /** Bumped on every import so the viewport knows to re-frame the camera. */
+  importVersion: number;
   parts: Map<string, PartState>;
   partOrder: string[];
   relations: Relation[];
@@ -50,9 +53,11 @@ interface AssemblyStore {
 }
 
 let relationCounter = 0;
+let importCounter = 0;
 
 export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
-  fileName: null,
+  fileNames: [],
+  importVersion: 0,
   parts: new Map(),
   partOrder: [],
   relations: [],
@@ -66,29 +71,33 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
   lastSolve: null,
 
   importAssembly: (assembly: ImportedAssembly) => {
-    const parts = new Map<string, PartState>();
-    assembly.parts.forEach((part, i) => {
-      parts.set(part.id, {
-        part,
+    const importId = importCounter++;
+    const parts = new Map(get().parts);
+    const newIds: string[] = [];
+    assembly.parts.forEach((part) => {
+      // Prefix ids so a second (or third...) import never collides with parts
+      // already in the scene — imports add to the assembly, they don't replace it.
+      const id = `imp${importId}-${part.id}`;
+      newIds.push(id);
+      parts.set(id, {
+        part: { ...part, id },
         pose: { position: [...part.initialPose.position], quaternion: [...part.initialPose.quaternion] },
-        fixed: i === 0,
+        fixed: false,
         visible: true,
       });
     });
     set({
-      fileName: assembly.fileName,
+      fileNames: [...get().fileNames, assembly.fileName],
+      importVersion: get().importVersion + 1,
       parts,
-      partOrder: assembly.parts.map((p) => p.id),
-      relations: [],
-      selectedPartId: null,
+      partOrder: [...get().partOrder, ...newIds],
       pickedEntities: [],
-      lastSolve: null,
     });
   },
 
   clearAssembly: () =>
     set({
-      fileName: null,
+      fileNames: [],
       parts: new Map(),
       partOrder: [],
       relations: [],
