@@ -28,9 +28,14 @@ export default function App() {
 
       if (e.key === "Delete" || e.key === "Backspace") {
         const store = useAssemblyStore.getState();
-        if (!store.selectedPartId || store.isPlaying) return;
-        e.preventDefault();
-        store.deletePart(store.selectedPartId);
+        if (store.isPlaying) return;
+        if (store.selectedPartIds.size > 0) {
+          e.preventDefault();
+          store.bulkDeleteParts(Array.from(store.selectedPartIds));
+        } else if (store.selectedPartId) {
+          e.preventDefault();
+          store.deletePart(store.selectedPartId);
+        }
       }
     }
     window.addEventListener("keydown", onKeyDown);

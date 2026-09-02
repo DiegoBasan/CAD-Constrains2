@@ -209,6 +209,11 @@ interface AssemblyStore {
 
   splitPart: (partId: string) => void;
   deletePart: (partId: string) => void;
+  /** Deletes every listed part in one undo step — the Delete/Backspace key handler
+   * (App.tsx) needs this for a multi-selection, since deletePart one at a time would
+   * both push one history snapshot per part (an N-step undo for what the user
+   * experiences as a single action) and re-run the full solver N times over. */
+  bulkDeleteParts: (partIds: string[]) => void;
 
   setRelationAngleLimits: (id: string, angleMin: number, angleMax: number) => void;
   clearRelationAngleLimits: (id: string) => void;
@@ -1082,6 +1087,24 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
       relations: get().relations.filter((r) => r.a.partId !== partId && r.b.partId !== partId),
       selectedPartId: selectedPartId === partId ? null : selectedPartId,
       pickedEntities: pickedEntities.filter((e) => e.partId !== partId),
+    });
+    get().runSolve();
+  },
+
+  bulkDeleteParts: (partIds) => {
+    const ids = new Set(partIds.filter((id) => get().parts.has(id)));
+    if (ids.size === 0) return;
+    get().pushHistorySnapshot();
+    const parts = new Map(get().parts);
+    for (const id of ids) parts.delete(id);
+    const { selectedPartId, pickedEntities } = get();
+    set({
+      parts,
+      partOrder: get().partOrder.filter((id) => !ids.has(id)),
+      relations: get().relations.filter((r) => !ids.has(r.a.partId) && !ids.has(r.b.partId)),
+      selectedPartId: selectedPartId && ids.has(selectedPartId) ? null : selectedPartId,
+      selectedPartIds: new Set(),
+      pickedEntities: pickedEntities.filter((e) => !ids.has(e.partId)),
     });
     get().runSolve();
   },

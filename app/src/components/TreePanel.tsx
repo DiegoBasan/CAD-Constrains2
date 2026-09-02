@@ -54,6 +54,7 @@ export function TreePanel() {
   const splitPart = useAssemblyStore((s) => s.splitPart);
   const bulkSetFixed = useAssemblyStore((s) => s.bulkSetFixed);
   const bulkSetColor = useAssemblyStore((s) => s.bulkSetColor);
+  const bulkDeleteParts = useAssemblyStore((s) => s.bulkDeleteParts);
   const addCamera = useAssemblyStore((s) => s.addCamera);
 
   const [editingGroupId, setEditingGroupId] = useState<string | null>(null);
@@ -167,6 +168,14 @@ export function TreePanel() {
                 className="h-4 w-6 cursor-pointer rounded border-0 bg-transparent p-0"
               />
             </label>
+            <button
+              onClick={() => bulkDeleteParts(Array.from(selectedPartIds))}
+              title="Eliminar todas las piezas seleccionadas"
+              className="hover:opacity-80"
+              style={{ color: "var(--danger)" }}
+            >
+              🗑 Eliminar
+            </button>
             <button onClick={clearMultiSelect} className="ml-auto underline hover:opacity-80">
               Limpiar
             </button>
