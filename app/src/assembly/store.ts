@@ -1,9 +1,9 @@
 import * as THREE from "three";
 import { create } from "zustand";
-import type { EntityRef, ImportedAssembly, ImportedPart, Pose, Vec3 } from "../occ/types";
+import type { EntityRef, ImportedAssembly, ImportedPart, Pose, Quat, Vec3 } from "../occ/types";
 import { countConnectedBodies, splitPartMesh } from "../occ/split";
 import { applicableRelationTypes, resolveEntity, type Relation, type RelationType } from "./relations";
-import { solveAssembly, type DragHint } from "./solver";
+import { solveAssembly } from "./solver";
 
 export interface PartState {
   part: ImportedPart;
@@ -34,6 +34,18 @@ interface HistorySnapshot {
 
 const MAX_HISTORY = 50;
 
+/** A named snapshot of every part's pose, for the keyframe/playback feature — save the
+ * assembly's current (already relation-satisfying) pose under a name, move things
+ * around, save another, and play back an interpolated, constraint-respecting motion
+ * between them. */
+export interface Keyframe {
+  id: string;
+  name: string;
+  poses: Map<string, Pose>;
+}
+
+const PLAYBACK_SEGMENT_MS = 1400;
+
 interface AssemblyStore {
   /** One entry per file imported so far (imports add to the assembly, they don't replace it). */
   fileNames: string[];
@@ -44,6 +56,8 @@ interface AssemblyStore {
   relations: Relation[];
   history: HistorySnapshot[];
   future: HistorySnapshot[];
+  keyframes: Keyframe[];
+  isPlaying: boolean;
 
   selectedPartId: string | null;
   pickedEntities: EntityRef[];
@@ -90,16 +104,54 @@ interface AssemblyStore {
 
   runSolve: () => void;
   /** Real-time preview during an interactive drag: re-solves with the dragged part's
-   * cursor target blended in as a soft goal (see DragHint), applied to every part the
-   * relations move as a result — but skipped-restart (fast, warm-started) and never
-   * touches history or `lastSolve`, since it's not a discrete user action by itself. */
-  applyDragPreview: (hint: DragHint) => void;
+   * pose seeded at the cursor's implied target (rather than its last-solved pose)
+   * instead of its actual current one — the solve's minimum-norm correction back onto
+   * the constraint manifold is exactly "move freely along whatever DOF the relations
+   * leave open, resist the rest," applied every frame instead of only on release.
+   * Skips restarts (fast, warm-started) and never touches history or `lastSolve`,
+   * since it's not a discrete user action by itself. */
+  applyDragPreview: (partId: string, patch: { position?: Vec3; quaternion?: Quat }) => void;
+
+  saveKeyframe: (name?: string) => void;
+  deleteKeyframe: (id: string) => void;
+  renameKeyframe: (id: string, name: string) => void;
+  playKeyframes: () => void;
+  stopPlayback: () => void;
 
   applicableRelationTypesForPicked: () => RelationType[];
 }
 
 let relationCounter = 0;
 let importCounter = 0;
+let keyframeCounter = 0;
+let playbackToken = 0;
+
+/** Shared by the live-drag preview and keyframe playback: re-solve the assembly's
+ * relations, but starting each free part not from its last-solved pose but from
+ * `seed` where the seed provides one (falling back to its current pose otherwise).
+ * Fixed parts always keep their real current pose regardless of `seed` — solveAssembly
+ * passes every part's starting pose straight through as its output unless it's free,
+ * so seeding a fixed part's pose would otherwise silently relocate it. */
+function solveFromSeed(parts: Map<string, PartState>, relations: Relation[], seed: Map<string, Pose>) {
+  const partMap = new Map<string, ImportedPart>();
+  const poses = new Map<string, Pose>();
+  const fixedIds = new Set<string>();
+  for (const [id, st] of parts) {
+    partMap.set(id, st.part);
+    poses.set(id, st.fixed ? st.pose : (seed.get(id) ?? st.pose));
+    if (st.fixed) fixedIds.add(id);
+  }
+  return solveAssembly({ parts: partMap, poses, fixedPartIds: fixedIds, relations, restarts: 0 });
+}
+
+function lerpPose(a: Pose, b: Pose, t: number): Pose {
+  const position = new THREE.Vector3(...a.position).lerp(new THREE.Vector3(...b.position), t);
+  const quaternion = new THREE.Quaternion(...a.quaternion).slerp(new THREE.Quaternion(...b.quaternion), t);
+  return {
+    position: [position.x, position.y, position.z],
+    quaternion: [quaternion.x, quaternion.y, quaternion.z, quaternion.w],
+  };
+}
 
 export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
   fileNames: [],
@@ -109,6 +161,8 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
   relations: [],
   history: [],
   future: [],
+  keyframes: [],
+  isPlaying: false,
 
   selectedPartId: null,
   pickedEntities: [],
@@ -154,6 +208,7 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
       parts: new Map(),
       partOrder: [],
       relations: [],
+      keyframes: [],
       selectedPartId: null,
       pickedEntities: [],
       lastSolve: null,
@@ -317,34 +372,97 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
     });
   },
 
-  applyDragPreview: (hint) => {
+  applyDragPreview: (partId, patch) => {
     const { parts, relations } = get();
-    if (parts.size === 0) return;
-
-    const partMap = new Map<string, ImportedPart>();
-    const poses = new Map<string, Pose>();
-    const fixedIds = new Set<string>();
-    for (const [id, st] of parts) {
-      partMap.set(id, st.part);
-      poses.set(id, st.pose);
-      if (st.fixed) fixedIds.add(id);
-    }
-
-    const result = solveAssembly({
-      parts: partMap,
-      poses,
-      fixedPartIds: fixedIds,
-      relations,
-      dragHint: hint,
-      restarts: 0,
-    });
+    const entry = parts.get(partId);
+    if (!entry) return;
+    const seedPose: Pose = { position: patch.position ?? entry.pose.position, quaternion: patch.quaternion ?? entry.pose.quaternion };
+    const result = solveFromSeed(parts, relations, new Map([[partId, seedPose]]));
 
     const nextParts = new Map(parts);
     for (const [id, pose] of result.poses) {
-      const entry = nextParts.get(id);
-      if (entry) nextParts.set(id, { ...entry, pose });
+      const e = nextParts.get(id);
+      if (e) nextParts.set(id, { ...e, pose });
     }
     set({ parts: nextParts });
+  },
+
+  saveKeyframe: (name) => {
+    const { parts, keyframes } = get();
+    if (parts.size === 0) return;
+    get().pushHistorySnapshot();
+    const poses = new Map<string, Pose>();
+    for (const [id, st] of parts) poses.set(id, st.pose);
+    const keyframe: Keyframe = { id: `kf-${keyframeCounter++}`, name: name?.trim() || `Pose ${keyframes.length + 1}`, poses };
+    set({ keyframes: [...keyframes, keyframe] });
+  },
+
+  deleteKeyframe: (id) => {
+    get().pushHistorySnapshot();
+    set({ keyframes: get().keyframes.filter((k) => k.id !== id) });
+  },
+
+  renameKeyframe: (id, name) => {
+    set({ keyframes: get().keyframes.map((k) => (k.id === id ? { ...k, name: name.trim() || k.name } : k)) });
+  },
+
+  playKeyframes: () => {
+    const { keyframes, isPlaying } = get();
+    if (keyframes.length < 2 || isPlaying) return;
+    const token = ++playbackToken;
+    set({ isPlaying: true });
+
+    function applySeed(seed: Map<string, Pose>) {
+      const { parts, relations } = get();
+      const result = solveFromSeed(parts, relations, seed);
+      const nextParts = new Map(parts);
+      for (const [id, pose] of result.poses) {
+        const e = nextParts.get(id);
+        if (e) nextParts.set(id, { ...e, pose });
+      }
+      set({ parts: nextParts });
+    }
+
+    function runSegment(from: Map<string, Pose>, to: Map<string, Pose>): Promise<void> {
+      return new Promise((resolve) => {
+        const start = performance.now();
+        const ids = new Set([...from.keys(), ...to.keys()]);
+        function tick(now: number) {
+          if (token !== playbackToken) {
+            resolve();
+            return;
+          }
+          const t = Math.min(1, (now - start) / PLAYBACK_SEGMENT_MS);
+          const seed = new Map<string, Pose>();
+          for (const id of ids) {
+            const a = from.get(id);
+            const b = to.get(id);
+            if (a && b) seed.set(id, lerpPose(a, b, t));
+            else if (b) seed.set(id, b);
+          }
+          applySeed(seed);
+          if (t < 1) requestAnimationFrame(tick);
+          else resolve();
+        }
+        requestAnimationFrame(tick);
+      });
+    }
+
+    (async () => {
+      for (let i = 0; i < keyframes.length - 1; i++) {
+        if (token !== playbackToken) break;
+        await runSegment(keyframes[i].poses, keyframes[i + 1].poses);
+      }
+      if (token === playbackToken) {
+        set({ isPlaying: false });
+        get().runSolve();
+      }
+    })();
+  },
+
+  stopPlayback: () => {
+    playbackToken++;
+    set({ isPlaying: false });
   },
 
   pushHistorySnapshot: () => {
