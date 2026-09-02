@@ -1,12 +1,31 @@
 import * as THREE from "three";
-import type { ImportedPart, Pose } from "../occ/types";
+import type { ImportedPart, Pose, Quat, Vec3 } from "../occ/types";
 import { relationResiduals, resolveEntity, type Relation } from "./relations";
+
+/** A soft, per-frame "pull toward the cursor" target for whichever part is being
+ * interactively dragged, blended into the same least-squares solve as the real
+ * relations (see DRAG_POS_WEIGHT/DRAG_ROT_WEIGHT below) — the part follows the cursor
+ * exactly where relations leave it free, and is resisted by them everywhere else, so
+ * dragging tracks the constraint in real time instead of moving free and snapping back
+ * only on release. */
+export interface DragHint {
+  partId: string;
+  targetPosition?: Vec3;
+  targetQuaternion?: Quat;
+}
 
 export interface SolveInput {
   parts: Map<string, ImportedPart>;
   poses: Map<string, Pose>;
   fixedPartIds: Set<string>;
   relations: Relation[];
+  dragHint?: DragHint;
+  /** Restart attempts on non-convergence (see RESTART_ATTEMPTS). Interactive per-frame
+   * drag calls pass 0 — warm-started from the previous frame they converge in a couple
+   * of iterations anyway, and a randomized restart mid-drag would visibly pop the part
+   * to an unrelated candidate pose. The final, hint-free solve on release keeps the
+   * default so it can still escape a genuine local minimum. */
+  restarts?: number;
 }
 
 export interface SolveResult {
@@ -37,13 +56,25 @@ const MAX_ROT_STEP = 0.15; // rad per accepted step (~8.6°)
 // relation's null space and a step can pick an arbitrarily large, unhelpful motion in
 // that null space. Small enough to be negligible next to any real constraint gradient,
 // it just keeps the system full-rank and each step's null-space component minimal.
-const REG_WEIGHT = 3e-3;
+const REG_WEIGHT = 0.02;
 // Orientation constraints (parallel, concentric, planar) make the objective genuinely
 // non-convex — a face's normal can align two different ways, and the landscape between
 // those basins can trap plain gradient descent short of either. A few restarts from
 // randomized free-part orientations are a cheap, standard way to escape that: each is a
 // full, cheap solve, and we keep whichever converges best.
 const RESTART_ATTEMPTS = 10;
+// Drag-hint weights: how strongly the cursor target pulls versus how strongly real
+// relations resist it. Deliberately soft relative to a typical relation residual (which
+// sits near O(1) in mm or unitless direction-cross-product terms) so that wherever a
+// relation actually constrains the motion, the relation wins the tug-of-war; wherever
+// it doesn't, the hint is the only force acting on that DOF and the part still tracks
+// the cursor exactly (the least-squares minimum of an unopposed linear pull is the
+// target itself, regardless of the weight's magnitude). The rotation weight is larger
+// because the quaternion-component residual it produces is naturally tiny (roughly
+// half the rotation angle in radians) next to relation residuals of comparable "one
+// step" size.
+const DRAG_POS_WEIGHT = 0.1;
+const DRAG_ROT_WEIGHT = 6;
 
 function expMapDelta(rot: THREE.Vector3): THREE.Quaternion {
   const angle = rot.length();
@@ -112,10 +143,25 @@ function solveOnce(
   startPoses: Map<string, Pose>,
   freeIds: string[],
   relations: Relation[],
+  dragHint?: DragHint,
 ): OnceResult {
   const n = freeIds.length * 6;
   const basePoses = new Map(startPoses);
   const x = new Float64Array(n); // [dPos(3), dRot(3)] per free part, relative to basePoses
+
+  // Resolve the drag target quaternion's hemisphere once, against the part's starting
+  // orientation for this solve — q and -q are the same rotation, and picking whichever
+  // sign is nearer keeps the residual a smooth pull instead of a coin-flip discontinuity.
+  let dragQuat: THREE.Quaternion | null = null;
+  if (dragHint?.targetQuaternion && freeIds.includes(dragHint.partId)) {
+    const start = startPoses.get(dragHint.partId);
+    const t = dragHint.targetQuaternion;
+    dragQuat = new THREE.Quaternion(t[0], t[1], t[2], t[3]);
+    if (start) {
+      const s = new THREE.Quaternion(...start.quaternion);
+      if (s.dot(dragQuat) < 0) dragQuat.set(-dragQuat.x, -dragQuat.y, -dragQuat.z, -dragQuat.w);
+    }
+  }
 
   function poseFor(partId: string, state: Float64Array): Pose {
     const base = basePoses.get(partId);
@@ -147,6 +193,24 @@ function solveOnce(
       const b = resolveEntity(partB, rel.b, poseB);
       if (!a || !b) continue;
       out.push(...relationResiduals(rel, a, b));
+    }
+    if (dragHint && freeIds.includes(dragHint.partId)) {
+      const pose = poseFor(dragHint.partId, state);
+      if (dragHint.targetPosition) {
+        const t = dragHint.targetPosition;
+        out.push(
+          (pose.position[0] - t[0]) * DRAG_POS_WEIGHT,
+          (pose.position[1] - t[1]) * DRAG_POS_WEIGHT,
+          (pose.position[2] - t[2]) * DRAG_POS_WEIGHT,
+        );
+      }
+      if (dragQuat) {
+        out.push(
+          (pose.quaternion[0] - dragQuat.x) * DRAG_ROT_WEIGHT,
+          (pose.quaternion[1] - dragQuat.y) * DRAG_ROT_WEIGHT,
+          (pose.quaternion[2] - dragQuat.z) * DRAG_ROT_WEIGHT,
+        );
+      }
     }
     return out;
   }
@@ -265,17 +329,18 @@ function randomPerturbedPoses(base: Map<string, Pose>, freeIds: string[]): Map<s
 }
 
 export function solveAssembly(input: SolveInput): SolveResult {
-  const { parts, poses, fixedPartIds, relations } = input;
+  const { parts, poses, fixedPartIds, relations, dragHint } = input;
   const freeIds = Array.from(poses.keys()).filter((id) => !fixedPartIds.has(id));
 
   const outPoses = new Map(poses);
-  if (freeIds.length === 0 || relations.length === 0) {
+  if (freeIds.length === 0 || (relations.length === 0 && !dragHint)) {
     return { poses: outPoses, residualNorm: 0, iterations: 0, converged: true };
   }
 
-  let best = solveOnce(parts, poses, freeIds, relations);
-  for (let attempt = 0; attempt < RESTART_ATTEMPTS && !best.converged; attempt++) {
-    const candidate = solveOnce(parts, randomPerturbedPoses(poses, freeIds), freeIds, relations);
+  const restarts = input.restarts ?? RESTART_ATTEMPTS;
+  let best = solveOnce(parts, poses, freeIds, relations, dragHint);
+  for (let attempt = 0; attempt < restarts && !best.converged; attempt++) {
+    const candidate = solveOnce(parts, randomPerturbedPoses(poses, freeIds), freeIds, relations, dragHint);
     if (candidate.residualNorm < best.residualNorm) best = candidate;
   }
   return best;

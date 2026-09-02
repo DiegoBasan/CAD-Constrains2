@@ -1,4 +1,4 @@
-import { useAssemblyStore, type ViewPreset, type TransformMode } from "../assembly/store";
+import { useAssemblyStore, type ViewPreset, type TransformMode, type RotatePivotMode } from "../assembly/store";
 import { ImportButton } from "./ImportButton";
 
 const VIEWS: { id: ViewPreset; label: string }[] = [
@@ -13,19 +13,30 @@ const MODES: { id: TransformMode; label: string }[] = [
   { id: "rotate", label: "Rotar" },
 ];
 
+const PIVOT_MODES: { id: RotatePivotMode; label: string; title: string }[] = [
+  { id: "part", label: "Pieza", title: "Gira sobre el propio centro de la pieza" },
+  { id: "camera", label: "Cámara", title: "Gira alrededor del punto que mira la cámara" },
+  { id: "free", label: "Libre", title: "Giro libre tipo bola (arcball), sin eje fijo" },
+];
+
 function ToolbarButton({
   active,
   onClick,
+  title,
+  small,
   children,
 }: {
   active?: boolean;
   onClick: () => void;
+  title?: string;
+  small?: boolean;
   children: React.ReactNode;
 }) {
   return (
     <button
       onClick={onClick}
-      className="rounded-md px-2.5 py-1.5 text-[12px] font-medium transition-colors"
+      title={title}
+      className={`rounded-md font-medium transition-colors ${small ? "px-2 py-1 text-[11px]" : "px-2.5 py-1.5 text-[12px]"}`}
       style={{
         background: active ? "var(--accent-bg)" : "transparent",
         color: active ? "var(--accent)" : "var(--text-dim)",
@@ -41,6 +52,8 @@ export function Toolbar() {
   const requestView = useAssemblyStore((s) => s.requestView);
   const transformMode = useAssemblyStore((s) => s.transformMode);
   const setTransformMode = useAssemblyStore((s) => s.setTransformMode);
+  const rotatePivotMode = useAssemblyStore((s) => s.rotatePivotMode);
+  const setRotatePivotMode = useAssemblyStore((s) => s.setRotatePivotMode);
   const fileNames = useAssemblyStore((s) => s.fileNames);
   const partCount = useAssemblyStore((s) => s.partOrder.length);
 
@@ -72,6 +85,22 @@ export function Toolbar() {
           </ToolbarButton>
         ))}
       </div>
+
+      {transformMode === "rotate" && (
+        <div className="flex items-center gap-1 pl-3" style={{ borderLeft: "1px solid var(--border)" }}>
+          {PIVOT_MODES.map((m) => (
+            <ToolbarButton
+              key={m.id}
+              small
+              title={m.title}
+              active={rotatePivotMode === m.id}
+              onClick={() => setRotatePivotMode(m.id)}
+            >
+              {m.label}
+            </ToolbarButton>
+          ))}
+        </div>
+      )}
 
       <div className="ml-auto flex items-center gap-2 text-[11px]" style={{ color: "var(--text-dim)" }}>
         {fileNames.length > 0 && (

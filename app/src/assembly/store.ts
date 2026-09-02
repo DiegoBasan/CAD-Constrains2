@@ -3,7 +3,7 @@ import { create } from "zustand";
 import type { EntityRef, ImportedAssembly, ImportedPart, Pose, Vec3 } from "../occ/types";
 import { countConnectedBodies, splitPartMesh } from "../occ/split";
 import { applicableRelationTypes, resolveEntity, type Relation, type RelationType } from "./relations";
-import { solveAssembly } from "./solver";
+import { solveAssembly, type DragHint } from "./solver";
 
 export interface PartState {
   part: ImportedPart;
@@ -18,6 +18,10 @@ export interface PartState {
 
 export type ViewPreset = "iso" | "front" | "top" | "right";
 export type TransformMode = "translate" | "rotate";
+/** Which pivot a rotate-drag turns the selected part around: "part" spins it in place
+ * about its own origin, "camera" orbits it (position and orientation both) about the
+ * camera's look-at point, "free" is an unconstrained arcball around its own origin. */
+export type RotatePivotMode = "part" | "camera" | "free";
 
 /** A snapshot of the assembly's data (not UI/selection state) for undo/redo. Safe as a
  * shallow reference capture: every mutation in this store replaces `parts`/`partOrder`/
@@ -47,6 +51,7 @@ interface AssemblyStore {
    * instead of feeding the normal two-pick "new relation" flow. */
   editingRelationSide: { relationId: string; side: "a" | "b" } | null;
   transformMode: TransformMode;
+  rotatePivotMode: RotatePivotMode;
   requestedView: ViewPreset | null;
 
   isSolving: boolean;
@@ -63,6 +68,7 @@ interface AssemblyStore {
   toggleFixed: (partId: string) => void;
   toggleVisible: (partId: string) => void;
   setTransformMode: (mode: TransformMode) => void;
+  setRotatePivotMode: (mode: RotatePivotMode) => void;
   requestView: (view: ViewPreset) => void;
   consumeRequestedView: () => void;
 
@@ -83,6 +89,11 @@ interface AssemblyStore {
   redo: () => void;
 
   runSolve: () => void;
+  /** Real-time preview during an interactive drag: re-solves with the dragged part's
+   * cursor target blended in as a soft goal (see DragHint), applied to every part the
+   * relations move as a result — but skipped-restart (fast, warm-started) and never
+   * touches history or `lastSolve`, since it's not a discrete user action by itself. */
+  applyDragPreview: (hint: DragHint) => void;
 
   applicableRelationTypesForPicked: () => RelationType[];
 }
@@ -103,6 +114,7 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
   pickedEntities: [],
   editingRelationSide: null,
   transformMode: "translate",
+  rotatePivotMode: "part",
   requestedView: "iso",
 
   isSolving: false,
@@ -201,6 +213,7 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
   },
 
   setTransformMode: (mode) => set({ transformMode: mode }),
+  setRotatePivotMode: (mode) => set({ rotatePivotMode: mode }),
   requestView: (view) => set({ requestedView: view }),
   consumeRequestedView: () => set({ requestedView: null }),
 
@@ -302,6 +315,36 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
       isSolving: false,
       lastSolve: { residualNorm: result.residualNorm, converged: result.converged },
     });
+  },
+
+  applyDragPreview: (hint) => {
+    const { parts, relations } = get();
+    if (parts.size === 0) return;
+
+    const partMap = new Map<string, ImportedPart>();
+    const poses = new Map<string, Pose>();
+    const fixedIds = new Set<string>();
+    for (const [id, st] of parts) {
+      partMap.set(id, st.part);
+      poses.set(id, st.pose);
+      if (st.fixed) fixedIds.add(id);
+    }
+
+    const result = solveAssembly({
+      parts: partMap,
+      poses,
+      fixedPartIds: fixedIds,
+      relations,
+      dragHint: hint,
+      restarts: 0,
+    });
+
+    const nextParts = new Map(parts);
+    for (const [id, pose] of result.poses) {
+      const entry = nextParts.get(id);
+      if (entry) nextParts.set(id, { ...entry, pose });
+    }
+    set({ parts: nextParts });
   },
 
   pushHistorySnapshot: () => {

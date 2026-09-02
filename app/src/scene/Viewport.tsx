@@ -1,7 +1,7 @@
 import { useEffect, useRef } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
-import { useAssemblyStore } from "../assembly/store";
+import { useAssemblyStore, type RotatePivotMode } from "../assembly/store";
 import type { ImportedPart } from "../occ/types";
 import { EDGE_COLOR, EDGE_HIGHLIGHT_COLOR, PICK_COLOR, SELECTED_PART_COLOR, partColor } from "./colors";
 import { applyViewPreset } from "./viewPresets";
@@ -16,30 +16,109 @@ interface PartVisual {
 }
 
 /** An in-progress direct-manipulation drag on the selected part's body — free (not
- * axis-constrained) translate in the camera's view plane, or free spin about the
- * view axis for rotate. Armed on pointerdown over the part; only becomes an actual
- * drag once the pointer moves past the click threshold, so a plain tap still falls
- * through to face/edge picking. */
+ * axis-constrained) translate in the camera's view plane, or one of three rotate
+ * pivots (see RotatePivotMode). Armed on pointerdown over the part; only becomes an
+ * actual drag once the pointer moves past the click threshold, so a plain tap still
+ * falls through to face/edge picking. Every frame's target is fed to the solver as a
+ * soft goal alongside the real relations (store.applyDragPreview), so the part tracks
+ * the cursor in real time within whatever freedom the relations leave it. */
 type ArmedDrag =
-  | {
-      kind: "translate";
-      partId: string;
-      dragging: boolean;
-      plane: THREE.Plane;
-      startPoint: THREE.Vector3;
-      startPosition: THREE.Vector3;
-      startQuaternion: THREE.Quaternion;
-    }
-  | {
-      kind: "rotate";
-      partId: string;
-      dragging: boolean;
-      centerScreen: THREE.Vector2;
-      startAngle: number;
-      viewAxis: THREE.Vector3;
-      startPosition: THREE.Vector3;
-      startQuaternion: THREE.Quaternion;
-    };
+  | { kind: "translate"; partId: string; dragging: boolean; plane: THREE.Plane; startPoint: THREE.Vector3; startPosition: THREE.Vector3 }
+  | { kind: "rotate"; partId: string; dragging: boolean; pivotMode: RotatePivotMode; lastScreen: THREE.Vector2 };
+
+// Below this many screen pixels from the rotation center, a screen-angle-based
+// rotation (part-spin and free-arcball modes) becomes numerically unstable — a tiny
+// cursor move sweeps a huge angle right at the center, which is exactly the "se
+// imanta"/jumpy feeling this replaces. Skip the frame instead of computing a wild
+// delta; incremental (not absolute-angle) tracking means skipping one frame near the
+// center costs nothing once the cursor moves back out.
+const MIN_PIVOT_RADIUS = 14;
+const CAMERA_ORBIT_SENSITIVITY = 0.008; // rad per pixel of drag
+
+function computeRotatePart(
+  camera: THREE.OrthographicCamera,
+  rect: DOMRect,
+  curPos: THREE.Vector3,
+  curQuat: THREE.Quaternion,
+  lastScreen: THREE.Vector2,
+  mouseScreen: THREE.Vector2,
+): THREE.Quaternion | null {
+  const centerNdc = curPos.clone().project(camera);
+  const centerScreen = new THREE.Vector2(((centerNdc.x + 1) / 2) * rect.width, ((1 - centerNdc.y) / 2) * rect.height);
+  const prevVec = lastScreen.clone().sub(centerScreen);
+  const currVec = mouseScreen.clone().sub(centerScreen);
+  if (prevVec.length() < MIN_PIVOT_RADIUS || currVec.length() < MIN_PIVOT_RADIUS) return null;
+  prevVec.normalize();
+  currVec.normalize();
+  const cross = prevVec.x * currVec.y - prevVec.y * currVec.x;
+  const dot = THREE.MathUtils.clamp(prevVec.dot(currVec), -1, 1);
+  const deltaAngle = Math.atan2(cross, dot);
+  const viewAxis = new THREE.Vector3();
+  camera.getWorldDirection(viewAxis);
+  const deltaQuat = new THREE.Quaternion().setFromAxisAngle(viewAxis, -deltaAngle);
+  return deltaQuat.multiply(curQuat);
+}
+
+function computeRotateCamera(
+  camera: THREE.OrthographicCamera,
+  orbitTarget: THREE.Vector3,
+  curPos: THREE.Vector3,
+  curQuat: THREE.Quaternion,
+  dx: number,
+  dy: number,
+): { position: THREE.Vector3; quaternion: THREE.Quaternion } {
+  const rightAxis = new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 0).normalize();
+  const upAxis = new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 1).normalize();
+  const yaw = dx * CAMERA_ORBIT_SENSITIVITY;
+  const pitch = -dy * CAMERA_ORBIT_SENSITIVITY;
+  const deltaQuat = new THREE.Quaternion()
+    .setFromAxisAngle(upAxis, yaw)
+    .multiply(new THREE.Quaternion().setFromAxisAngle(rightAxis, pitch));
+  const offset = curPos.clone().sub(orbitTarget).applyQuaternion(deltaQuat);
+  return { position: orbitTarget.clone().add(offset), quaternion: deltaQuat.clone().multiply(curQuat) };
+}
+
+function computeRotateFree(
+  camera: THREE.OrthographicCamera,
+  rect: DOMRect,
+  curPos: THREE.Vector3,
+  curQuat: THREE.Quaternion,
+  lastScreen: THREE.Vector2,
+  mouseScreen: THREE.Vector2,
+): THREE.Quaternion | null {
+  const centerNdc = curPos.clone().project(camera);
+  const centerScreen = new THREE.Vector2(((centerNdc.x + 1) / 2) * rect.width, ((1 - centerNdc.y) / 2) * rect.height);
+  const radius = Math.max(Math.min(rect.width, rect.height) * 0.4, 1);
+
+  function mapToSphere(p: THREE.Vector2): THREE.Vector3 {
+    const dx = (p.x - centerScreen.x) / radius;
+    const dy = (p.y - centerScreen.y) / radius;
+    const d2 = dx * dx + dy * dy;
+    if (d2 <= 1) return new THREE.Vector3(dx, dy, Math.sqrt(1 - d2));
+    const inv = 1 / Math.sqrt(d2);
+    return new THREE.Vector3(dx * inv, dy * inv, 0);
+  }
+
+  const pPrev = mapToSphere(lastScreen);
+  const pCurr = mapToSphere(mouseScreen);
+  const dot = THREE.MathUtils.clamp(pPrev.dot(pCurr), -1, 1);
+  const angle = Math.acos(dot);
+  if (angle < 1e-5) return null;
+  const axisLocal = new THREE.Vector3().crossVectors(pPrev, pCurr).normalize();
+  if (!Number.isFinite(axisLocal.x)) return null;
+
+  const rightAxis = new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 0).normalize();
+  const upAxis = new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 1).normalize();
+  const forwardAxis = new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 2).normalize(); // toward viewer
+  const axisWorld = rightAxis
+    .clone()
+    .multiplyScalar(axisLocal.x)
+    .add(upAxis.clone().multiplyScalar(-axisLocal.y))
+    .add(forwardAxis.clone().multiplyScalar(axisLocal.z))
+    .normalize();
+  const deltaQuat = new THREE.Quaternion().setFromAxisAngle(axisWorld, angle);
+  return deltaQuat.multiply(curQuat);
+}
 
 function buildPartVisual(part: ImportedPart, color: number): PartVisual {
   const group = new THREE.Group();
@@ -119,6 +198,7 @@ export function Viewport() {
   const visualsRef = useRef<Map<string, PartVisual>>(new Map());
   const pointerDownRef = useRef<{ x: number; y: number } | null>(null);
   const armedDragRef = useRef<ArmedDrag | null>(null);
+  const latestPointerRef = useRef<{ x: number; y: number } | null>(null);
   const viewSizeRef = useRef(200);
 
   const parts = useAssemblyStore((s) => s.parts);
@@ -225,9 +305,10 @@ export function Viewport() {
 
     function onPointerDown(e: PointerEvent) {
       pointerDownRef.current = { x: e.clientX, y: e.clientY };
+      latestPointerRef.current = { x: e.clientX, y: e.clientY };
       armedDragRef.current = null;
 
-      const { selectedPartId: selId, parts: currentParts, transformMode } = useAssemblyStore.getState();
+      const { selectedPartId: selId, parts: currentParts, transformMode, rotatePivotMode } = useAssemblyStore.getState();
       if (!selId) return;
       const state = currentParts.get(selId);
       const visual = visualsRef.current.get(selId);
@@ -254,33 +335,21 @@ export function Viewport() {
           plane,
           startPoint,
           startPosition: visual.group.position.clone(),
-          startQuaternion: visual.group.quaternion.clone(),
         };
       } else {
         const rect = containerRef.current!.getBoundingClientRect();
-        const centerNdc = visual.group.position.clone().project(camera);
-        const centerScreen = new THREE.Vector2(
-          ((centerNdc.x + 1) / 2) * rect.width,
-          ((1 - centerNdc.y) / 2) * rect.height,
-        );
-        const mouseScreen = new THREE.Vector2(e.clientX - rect.left, e.clientY - rect.top);
-        const startAngle = Math.atan2(mouseScreen.y - centerScreen.y, mouseScreen.x - centerScreen.x);
-        const viewAxis = new THREE.Vector3();
-        camera.getWorldDirection(viewAxis);
         armedDragRef.current = {
           kind: "rotate",
           partId: selId,
           dragging: false,
-          centerScreen,
-          startAngle,
-          viewAxis,
-          startPosition: visual.group.position.clone(),
-          startQuaternion: visual.group.quaternion.clone(),
+          pivotMode: rotatePivotMode,
+          lastScreen: new THREE.Vector2(e.clientX - rect.left, e.clientY - rect.top),
         };
       }
     }
 
     function onPointerMove(e: PointerEvent) {
+      latestPointerRef.current = { x: e.clientX, y: e.clientY };
       const armed = armedDragRef.current;
       if (!armed) {
         // Cursor affordance: "grab" over the draggable selected part, default elsewhere.
@@ -302,34 +371,57 @@ export function Viewport() {
         useAssemblyStore.getState().pushHistorySnapshot();
         dom.style.cursor = "grabbing";
       }
+    }
 
-      const rc = raycasterFromEvent(e.clientX, e.clientY);
-      if (!rc) return;
-      const visual = visualsRef.current.get(armed.partId);
-      if (!visual) return;
+    // The actual per-frame drag solve is throttled to the render loop (below) rather
+    // than run on every raw pointermove — pointermove can fire faster than the solver
+    // (and the resulting store update + React re-render) can keep up with, and letting
+    // them queue up is exactly what produces a laggy, "catches up in bursts" feel.
+    function processDragFrame() {
+      const armed = armedDragRef.current;
+      const pointer = latestPointerRef.current;
+      if (!armed || !armed.dragging || !pointer) return;
 
-      let position: THREE.Vector3;
-      let quaternion: THREE.Quaternion;
+      const store = useAssemblyStore.getState();
+      const currentState = store.parts.get(armed.partId);
+      if (!currentState) return;
+      const rect = containerRef.current?.getBoundingClientRect();
+      if (!rect) return;
+      const curPos = new THREE.Vector3(...currentState.pose.position);
+      const curQuat = new THREE.Quaternion(...currentState.pose.quaternion);
+
       if (armed.kind === "translate") {
+        const rc = raycasterFromEvent(pointer.x, pointer.y);
+        if (!rc) return;
         const hit = new THREE.Vector3();
         if (!rc.ray.intersectPlane(armed.plane, hit)) return;
-        position = armed.startPosition.clone().add(hit.sub(armed.startPoint));
-        quaternion = armed.startQuaternion.clone();
-      } else {
-        const rect = containerRef.current!.getBoundingClientRect();
-        const mouseScreen = new THREE.Vector2(e.clientX - rect.left, e.clientY - rect.top);
-        const angle = Math.atan2(mouseScreen.y - armed.centerScreen.y, mouseScreen.x - armed.centerScreen.x);
-        const delta = angle - armed.startAngle;
-        const deltaQuat = new THREE.Quaternion().setFromAxisAngle(armed.viewAxis, delta);
-        quaternion = deltaQuat.multiply(armed.startQuaternion.clone());
-        position = armed.startPosition.clone();
+        const target = armed.startPosition.clone().add(hit.sub(armed.startPoint));
+        store.applyDragPreview({ partId: armed.partId, targetPosition: [target.x, target.y, target.z] });
+        return;
       }
 
-      visual.group.position.copy(position);
-      visual.group.quaternion.copy(quaternion);
-      useAssemblyStore.getState().setPose(armed.partId, {
-        position: [position.x, position.y, position.z],
-        quaternion: [quaternion.x, quaternion.y, quaternion.z, quaternion.w],
+      const mouseScreen = new THREE.Vector2(pointer.x - rect.left, pointer.y - rect.top);
+      if (mouseScreen.distanceTo(armed.lastScreen) < 0.5) return; // no real movement since last frame
+
+      let targetPosition: THREE.Vector3 | undefined;
+      let targetQuaternion: THREE.Quaternion | null;
+      if (armed.pivotMode === "part") {
+        targetQuaternion = computeRotatePart(camera, rect, curPos, curQuat, armed.lastScreen, mouseScreen);
+      } else if (armed.pivotMode === "camera") {
+        const dx = mouseScreen.x - armed.lastScreen.x;
+        const dy = mouseScreen.y - armed.lastScreen.y;
+        const result = computeRotateCamera(camera, orbit.target, curPos, curQuat, dx, dy);
+        targetPosition = result.position;
+        targetQuaternion = result.quaternion;
+      } else {
+        targetQuaternion = computeRotateFree(camera, rect, curPos, curQuat, armed.lastScreen, mouseScreen);
+      }
+      armed.lastScreen = mouseScreen;
+      if (!targetQuaternion) return;
+      store.applyDragPreview({
+        partId: armed.partId,
+        targetPosition: targetPosition ? [targetPosition.x, targetPosition.y, targetPosition.z] : undefined,
+        targetQuaternion: [targetQuaternion.x, targetQuaternion.y, targetQuaternion.z, targetQuaternion.w],
       });
     }
 
@@ -355,6 +447,7 @@ export function Viewport() {
     let raf = 0;
     const animate = () => {
       orbit.update();
+      processDragFrame();
       renderer.render(scene, camera);
       raf = requestAnimationFrame(animate);
     };
