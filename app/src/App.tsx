@@ -26,6 +26,14 @@ export default function App() {
         return;
       }
 
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "d") {
+        const store = useAssemblyStore.getState();
+        if (!store.selectedPartId || store.isPlaying) return;
+        e.preventDefault(); // otherwise this is the browser's "bookmark this page"
+        store.duplicatePart(store.selectedPartId);
+        return;
+      }
+
       if (e.key === "Delete" || e.key === "Backspace") {
         const store = useAssemblyStore.getState();
         if (store.isPlaying) return;

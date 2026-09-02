@@ -209,6 +209,14 @@ interface AssemblyStore {
 
   splitPart: (partId: string) => void;
   deletePart: (partId: string) => void;
+  /** Clones a part (sharing its mesh — geometry is immutable, so there's nothing to
+   * actually copy there) at a small offset so it doesn't render exactly on top of the
+   * original, unfixed, ungrouped, and selected — everything else (color, axis
+   * locks/limits) carries over, since a duplicate is meant to behave like the original
+   * except for its own position. Never picks up the original's relations; those
+   * describe a specific geometric relationship to specific other parts, not something
+   * that transfers to a copy sitting somewhere else. */
+  duplicatePart: (partId: string) => void;
   /** Deletes every listed part in one undo step — the Delete/Backspace key handler
    * (App.tsx) needs this for a multi-selection, since deletePart one at a time would
    * both push one history snapshot per part (an N-step undo for what the user
@@ -269,6 +277,7 @@ let importCounter = 0;
 let keyframeCounter = 0;
 let groupCounter = 0;
 let cameraCounter = 0;
+let duplicateCounter = 0;
 let playbackToken = 0;
 
 /** Shared by the live-drag preview and keyframe playback: re-solve the assembly's
@@ -1089,6 +1098,27 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
       pickedEntities: pickedEntities.filter((e) => e.partId !== partId),
     });
     get().runSolve();
+  },
+
+  duplicatePart: (partId) => {
+    const entry = get().parts.get(partId);
+    if (!entry) return;
+    get().pushHistorySnapshot();
+    const newId = `dup-${duplicateCounter++}`;
+    const [x, y, z] = entry.pose.position;
+    const newEntry: PartState = {
+      ...entry,
+      part: { ...entry.part, id: newId, name: `${entry.part.name} (copia)` },
+      pose: { position: [x + 20, y + 20, z], quaternion: [...entry.pose.quaternion] },
+      fixed: false,
+      groupId: undefined,
+    };
+    const parts = new Map(get().parts);
+    parts.set(newId, newEntry);
+    const idx = get().partOrder.indexOf(partId);
+    const partOrder = [...get().partOrder];
+    partOrder.splice(idx + 1, 0, newId);
+    set({ parts, partOrder, selectedPartId: newId, selectedGroupId: null, selectedPartIds: new Set(), pickedEntities: [] });
   },
 
   bulkDeleteParts: (partIds) => {
