@@ -87,9 +87,16 @@ export interface Keyframe {
   id: string;
   name: string;
   poses: Map<string, Pose>;
+  /** How long the segment *ending* at this keyframe takes to play, in ms — i.e. this is
+   * the travel time from the PREVIOUS keyframe to this one, not from this one to the
+   * next (so the first keyframe's value is never actually used, since there's no
+   * segment before it). Undefined falls back to DEFAULT_SEGMENT_MS — every keyframe
+   * saved before this field existed, and any new one saved via the default "+" action,
+   * has no explicit value and just plays at the old fixed pace. */
+  durationMs?: number;
 }
 
-const PLAYBACK_SEGMENT_MS = 1400;
+export const DEFAULT_SEGMENT_MS = 1400;
 
 interface AssemblyStore {
   /** One entry per file imported so far (imports add to the assembly, they don't replace it). */
@@ -226,6 +233,13 @@ interface AssemblyStore {
   saveKeyframe: (name?: string) => void;
   deleteKeyframe: (id: string) => void;
   renameKeyframe: (id: string, name: string) => void;
+  /** Sets how long the segment ending at this keyframe (i.e. the travel time FROM the
+   * previous keyframe TO this one) takes to play, in seconds — clamped to a sane range
+   * so a stray 0 or negative value can't produce a divide-by-zero/instant "segment."
+   * Fires on every keystroke of its NumberField like the position/rotation fields do,
+   * so — also like them — pushing the undo snapshot is the caller's job (onCommitStart),
+   * not this action's; pushing here would flood history with one entry per keystroke. */
+  setKeyframeDurationSec: (id: string, seconds: number) => void;
   /** Jumps the live assembly to a saved keyframe's pose (re-solved, so it still
    * respects every relation even if the assembly has changed since it was saved). */
   previewKeyframe: (id: string) => void;
@@ -451,7 +465,7 @@ interface ProjectFile {
   parts: [string, SerializedPartState][];
   relations: Relation[];
   groups: Group[];
-  keyframes: { id: string; name: string; poses: [string, Pose][] }[];
+  keyframes: { id: string; name: string; poses: [string, Pose][]; durationMs?: number }[];
 }
 
 function serializePartState(st: PartState): SerializedPartState {
@@ -1161,6 +1175,11 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
     set({ keyframes: get().keyframes.map((k) => (k.id === id ? { ...k, name: name.trim() || k.name } : k)) });
   },
 
+  setKeyframeDurationSec: (id, seconds) => {
+    const durationMs = THREE.MathUtils.clamp(seconds, 0.1, 60) * 1000;
+    set({ keyframes: get().keyframes.map((k) => (k.id === id ? { ...k, durationMs } : k)) });
+  },
+
   previewKeyframe: (id) => {
     const { keyframes, parts, relations, isPlaying } = get();
     if (isPlaying) return;
@@ -1197,7 +1216,7 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
       set({ parts: applyPosesToParts(parts, result.poses) });
     }
 
-    function runSegment(from: Map<string, Pose>, to: Map<string, Pose>): Promise<void> {
+    function runSegment(from: Map<string, Pose>, to: Map<string, Pose>, durationMs: number): Promise<void> {
       return new Promise((resolve) => {
         const start = performance.now();
         const ids = new Set([...from.keys(), ...to.keys()]);
@@ -1206,7 +1225,7 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
             resolve();
             return;
           }
-          const t = Math.min(1, (now - start) / PLAYBACK_SEGMENT_MS);
+          const t = Math.min(1, (now - start) / durationMs);
           const seed = new Map<string, Pose>();
           for (const id of ids) {
             const a = from.get(id);
@@ -1226,7 +1245,7 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
       do {
         for (let i = 0; i < keyframes.length - 1; i++) {
           if (token !== playbackToken) break;
-          await runSegment(keyframes[i].poses, keyframes[i + 1].poses);
+          await runSegment(keyframes[i].poses, keyframes[i + 1].poses, keyframes[i + 1].durationMs ?? DEFAULT_SEGMENT_MS);
         }
       } while (token === playbackToken && get().loopPlayback);
       if (token === playbackToken) {
@@ -1309,7 +1328,7 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
       parts: Array.from(parts.entries()).map(([id, st]) => [id, serializePartState(st)]),
       relations,
       groups,
-      keyframes: keyframes.map((k) => ({ id: k.id, name: k.name, poses: Array.from(k.poses.entries()) })),
+      keyframes: keyframes.map((k) => ({ id: k.id, name: k.name, poses: Array.from(k.poses.entries()), durationMs: k.durationMs })),
     };
     return JSON.stringify(file);
   },
@@ -1327,7 +1346,7 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
     get().pushHistorySnapshot();
 
     const parts = new Map<string, PartState>(file.parts.map(([id, st]) => [id, deserializePartState(st)]));
-    const keyframes: Keyframe[] = file.keyframes.map((k) => ({ id: k.id, name: k.name, poses: new Map(k.poses) }));
+    const keyframes: Keyframe[] = file.keyframes.map((k) => ({ id: k.id, name: k.name, poses: new Map(k.poses), durationMs: k.durationMs }));
 
     // Bump every id counter past whatever this file contains, so anything created
     // *after* importing never collides with an id the import just brought in.

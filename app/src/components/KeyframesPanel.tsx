@@ -1,4 +1,35 @@
-import { useAssemblyStore } from "../assembly/store";
+import { DEFAULT_SEGMENT_MS, useAssemblyStore } from "../assembly/store";
+import { NumberField } from "./NumberField";
+
+/** The travel-time control for the segment ending at `id` — sits between the previous
+ * keyframe's chip and this one, so it reads left-to-right as "from here to here takes
+ * X seconds," matching the field it actually edits (durationMs is the time to reach
+ * THIS keyframe from the previous one, not from this one to the next). */
+function SegmentDurationControl({ id, durationMs }: { id: string; durationMs: number | undefined }) {
+  const isPlaying = useAssemblyStore((s) => s.isPlaying);
+  const setKeyframeDurationSec = useAssemblyStore((s) => s.setKeyframeDurationSec);
+  const pushHistorySnapshot = useAssemblyStore((s) => s.pushHistorySnapshot);
+  const seconds = (durationMs ?? DEFAULT_SEGMENT_MS) / 1000;
+
+  return (
+    <div className="flex shrink-0 flex-col items-center gap-0.5 px-0.5" style={{ color: "var(--text-dim)" }}>
+      <span className="text-[9px]">→</span>
+      <label className="flex items-center gap-0.5 text-[10px]" title="Duración de este tramo (segundos)">
+        <NumberField
+          value={seconds}
+          onCommit={(v) => setKeyframeDurationSec(id, v)}
+          onCommitStart={pushHistorySnapshot}
+          disabled={isPlaying}
+          step={0.1}
+          precision={1}
+          className="w-9 rounded border px-0.5 py-0 text-center text-[10px]"
+          style={{ borderColor: "var(--border-strong)", background: "var(--bg-2)", color: "var(--text)" }}
+        />
+        s
+      </label>
+    </div>
+  );
+}
 
 function KeyframeChip({ id, index, name }: { id: string; index: number; name: string }) {
   const isPlaying = useAssemblyStore((s) => s.isPlaying);
@@ -74,7 +105,10 @@ export function KeyframesPanel() {
           </span>
         )}
         {keyframes.map((kf, i) => (
-          <KeyframeChip key={kf.id} id={kf.id} index={i} name={kf.name} />
+          <div key={kf.id} className="flex shrink-0 items-center">
+            {i > 0 && <SegmentDurationControl id={kf.id} durationMs={kf.durationMs} />}
+            <KeyframeChip id={kf.id} index={i} name={kf.name} />
+          </div>
         ))}
       </div>
 
