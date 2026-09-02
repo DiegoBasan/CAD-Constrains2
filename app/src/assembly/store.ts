@@ -124,6 +124,12 @@ interface AssemblyStore {
    * bulk action bar (color/group/fix/vincular) also reads from this set. */
   selectedPartIds: Set<string>;
   pickedEntities: EntityRef[];
+  /** The face/edge under the cursor while Ctrl/Cmd is held, before the click that
+   * actually picks it — lets the viewport preview-highlight it, so the user can see
+   * exactly what they're about to pick instead of finding out only after clicking. Set
+   * by Viewport's pointermove handling, not a discrete user action, so it never touches
+   * undo history. */
+  hoverEntity: EntityRef | null;
   /** When set, the next entity pick replaces that side of the given relation
    * instead of feeding the normal two-pick "new relation" flow. */
   editingRelationSide: { relationId: string; side: "a" | "b" } | null;
@@ -149,6 +155,7 @@ interface AssemblyStore {
   selectPart: (partId: string | null) => void;
   pickEntity: (ref: EntityRef) => void;
   clearPicked: () => void;
+  setHoverEntity: (ref: EntityRef | null) => void;
 
   /** Adds/removes one part from the ad-hoc multi-selection, independent of
    * selectedPartId/selectedGroupId. Used by both Ctrl/Cmd-click in the tree and
@@ -560,6 +567,7 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
   selectedGroupId: null,
   selectedPartIds: new Set(),
   pickedEntities: [],
+  hoverEntity: null,
   editingRelationSide: null,
   transformMode: "translate",
   rotatePivotMode: "part",
@@ -829,6 +837,7 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
   },
 
   clearPicked: () => set({ pickedEntities: [] }),
+  setHoverEntity: (ref) => set({ hoverEntity: ref }),
 
   setPose: (partId, pose) => {
     const parts = new Map(get().parts);

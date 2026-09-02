@@ -17,3 +17,9 @@ export const UNIFORM_GRAY_COLOR = 0xadadb1;
 export const PICK_COLOR = 0x4fa3ff;
 export const EDGE_COLOR = 0x151515;
 export const EDGE_HIGHLIGHT_COLOR = 0x4fa3ff;
+/** Hover preview while Ctrl/Cmd is held, before the click that actually picks — a warm
+ * amber so it reads as "about to pick this" and is never confused with PICK_COLOR's
+ * blue "already picked," even when both are visible on the same part at once (e.g.
+ * hovering a second candidate face while a first is already picked). */
+export const HOVER_COLOR = 0xffb454;
+export const EDGE_HOVER_COLOR = 0xffb454;

@@ -2,8 +2,17 @@ import { useEffect, useRef } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { useAssemblyStore, type CameraProjection, type PartState, type RotatePivotMode, type ViewPreset } from "../assembly/store";
-import type { ImportedPart } from "../occ/types";
-import { EDGE_COLOR, EDGE_HIGHLIGHT_COLOR, PICK_COLOR, SELECTED_PART_COLOR, UNIFORM_GRAY_COLOR, partColor } from "./colors";
+import type { EntityRef, ImportedPart } from "../occ/types";
+import {
+  EDGE_COLOR,
+  EDGE_HIGHLIGHT_COLOR,
+  EDGE_HOVER_COLOR,
+  HOVER_COLOR,
+  PICK_COLOR,
+  SELECTED_PART_COLOR,
+  UNIFORM_GRAY_COLOR,
+  partColor,
+} from "./colors";
 import { applyViewPreset } from "./viewPresets";
 
 type SceneCamera = THREE.OrthographicCamera | THREE.PerspectiveCamera;
@@ -47,6 +56,11 @@ interface PartVisual {
    * 1:1 index like it would be for straight-only edges. */
   edgeSegmentIndex: Int32Array;
   highlightMesh: THREE.Mesh | null;
+  /** The Ctrl/Cmd-hover face preview overlay — separate from highlightMesh (the
+   * already-picked face) since both can be visible on the same part at once (hovering a
+   * second candidate face while a first is already picked for the relation's other
+   * side). */
+  hoverMesh: THREE.Mesh | null;
   /** True for a camera object's visual — `mesh` is an invisible pickable proxy (a
    * camera has no real solid geometry) and `edgeLines` is its frustum gizmo, not real
    * part edges, so several places (edge-picking, body-color reconciliation) need to
@@ -118,6 +132,7 @@ function buildCameraVisual(partId: string): PartVisual {
     edgeLines,
     edgeSegmentIndex: new Int32Array(0),
     highlightMesh: null,
+    hoverMesh: null,
     isCamera: true,
   };
 }
@@ -301,10 +316,10 @@ function buildPartVisual(part: ImportedPart, color: number): PartVisual {
   edgeLines.userData.partId = part.id;
   group.add(edgeLines);
 
-  return { group, mesh, material, baseColor: color, edgeLines, edgeSegmentIndex, highlightMesh: null };
+  return { group, mesh, material, baseColor: color, edgeLines, edgeSegmentIndex, highlightMesh: null, hoverMesh: null };
 }
 
-function buildFaceHighlight(part: ImportedPart, faceId: number): THREE.Mesh | null {
+function buildFaceHighlight(part: ImportedPart, faceId: number, color: number, opacity: number): THREE.Mesh | null {
   const { positions, indices, triangleFaceId } = part.mesh;
   const subset: number[] = [];
   for (let t = 0; t < triangleFaceId.length; t++) {
@@ -317,9 +332,9 @@ function buildFaceHighlight(part: ImportedPart, faceId: number): THREE.Mesh | nu
   geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
   geometry.setIndex(subset);
   const material = new THREE.MeshBasicMaterial({
-    color: PICK_COLOR,
+    color,
     transparent: true,
-    opacity: 0.45,
+    opacity,
     side: THREE.DoubleSide,
     depthTest: true,
   });
@@ -328,16 +343,20 @@ function buildFaceHighlight(part: ImportedPart, faceId: number): THREE.Mesh | nu
   return mesh;
 }
 
-function updateEdgeHighlight(visual: PartVisual, part: ImportedPart, highlightedEdgeId: number | null): void {
+/** Recolors every edge segment: `pickedEdgeId` (already picked, for a relation side)
+ * wins over `hoverEdgeId` (Ctrl-hover preview) when both land on the same edge, since
+ * "already picked" is the more important thing to keep visible. */
+function updateEdgeHighlight(visual: PartVisual, part: ImportedPart, pickedEdgeId: number | null, hoverEdgeId: number | null): void {
   // A camera's gizmo geometry has no per-vertex "color" attribute (it's a single flat
   // LineBasicMaterial color, not vertex-colored real edges) — nothing to highlight.
   if (visual.isCamera) return;
   const colorAttr = visual.edgeLines.geometry.getAttribute("color") as THREE.BufferAttribute;
   const normal = new THREE.Color(EDGE_COLOR);
-  const highlight = new THREE.Color(EDGE_HIGHLIGHT_COLOR);
+  const picked = new THREE.Color(EDGE_HIGHLIGHT_COLOR);
+  const hover = new THREE.Color(EDGE_HOVER_COLOR);
   for (let seg = 0; seg < visual.edgeSegmentIndex.length; seg++) {
     const edge = part.mesh.edges[visual.edgeSegmentIndex[seg]];
-    const c = edge?.id === highlightedEdgeId ? highlight : normal;
+    const c = edge?.id === pickedEdgeId ? picked : edge?.id === hoverEdgeId ? hover : normal;
     colorAttr.setXYZ(seg * 2, c.r, c.g, c.b);
     colorAttr.setXYZ(seg * 2 + 1, c.r, c.g, c.b);
   }
@@ -365,6 +384,7 @@ export function Viewport() {
   const selectedPartId = useAssemblyStore((s) => s.selectedPartId);
   const selectedPartIds = useAssemblyStore((s) => s.selectedPartIds);
   const pickedEntities = useAssemblyStore((s) => s.pickedEntities);
+  const hoverEntity = useAssemblyStore((s) => s.hoverEntity);
   const requestedView = useAssemblyStore((s) => s.requestedView);
   const consumeRequestedView = useAssemblyStore((s) => s.consumeRequestedView);
   const importVersion = useAssemblyStore((s) => s.importVersion);
@@ -555,11 +575,43 @@ export function Viewport() {
       return raycaster;
     }
 
+    // Resolves exactly which face or edge is under the cursor, the same way a
+    // Ctrl/Cmd-click pick does — shared between the actual pick (below) and the hover
+    // preview, so "what you're about to pick" and "what you actually get" can never
+    // disagree. Returns null over a camera (nothing to resolve a pick against) or empty
+    // space.
+    function resolvePickTarget(clientX: number, clientY: number): EntityRef | null {
+      const rc = raycasterFromEvent(clientX, clientY);
+      if (!rc) return null;
+      const { parts: currentParts } = useAssemblyStore.getState();
+      const visuals = Array.from(visualsRef.current.values());
+      const lineHits = rc.intersectObjects(visuals.map((v) => v.edgeLines), false);
+      const faceHits = rc.intersectObjects(visuals.map((v) => v.mesh), false);
+      const hitPartId = (lineHits[0] ?? faceHits[0])?.object.userData.partId as string | undefined;
+      if (!hitPartId || currentParts.get(hitPartId)?.isCamera) return null;
+
+      if (lineHits.length > 0) {
+        const hit = lineHits[0];
+        const partId = hit.object.userData.partId as string;
+        const segmentIndex = Math.floor((hit.index ?? 0) / 2);
+        const edgeIdx = visualsRef.current.get(partId)?.edgeSegmentIndex[segmentIndex];
+        const edge = edgeIdx !== undefined ? currentParts.get(partId)?.part.mesh.edges[edgeIdx] : undefined;
+        if (edge) return { partId, kind: "edge", id: edge.id };
+      }
+      if (faceHits.length > 0) {
+        const hit = faceHits[0];
+        const partId = hit.object.userData.partId as string;
+        const faceId = currentParts.get(partId)?.part.mesh.triangleFaceId[hit.faceIndex ?? 0];
+        if (faceId !== undefined) return { partId, kind: "face", id: faceId };
+      }
+      return null;
+    }
+
     function pick(clientX: number, clientY: number, shiftKey: boolean, ctrlKey: boolean) {
       const rc = raycasterFromEvent(clientX, clientY);
       if (!rc) return;
 
-      const { parts: currentParts, pickEntity, selectPart, toggleMultiSelect, clearMultiSelect } = useAssemblyStore.getState();
+      const { pickEntity, selectPart, toggleMultiSelect, clearMultiSelect } = useAssemblyStore.getState();
       const visuals = Array.from(visualsRef.current.values());
 
       const lineHits = rc.intersectObjects(visuals.map((v) => v.edgeLines), false);
@@ -579,30 +631,13 @@ export function Viewport() {
       // both the safer default (no more "clicked a body and accidentally picked
       // whatever face the raycaster happened to hit first, sometimes the back one
       // through thin/overlapping geometry") and consistent with Ctrl-click already
-      // meaning "get specific" everywhere else (tree panel multi-select). A camera has
-      // no faces/edges to resolve a pick against, so it always falls back to
-      // whole-object selection regardless of Ctrl.
-      if (ctrlKey && hitPartId && !currentParts.get(hitPartId)?.isCamera) {
-        clearMultiSelect();
-        if (lineHits.length > 0) {
-          const hit = lineHits[0];
-          const partId = hit.object.userData.partId as string;
-          const segmentIndex = Math.floor((hit.index ?? 0) / 2);
-          const edgeIdx = visualsRef.current.get(partId)?.edgeSegmentIndex[segmentIndex];
-          const edge = edgeIdx !== undefined ? currentParts.get(partId)?.part.mesh.edges[edgeIdx] : undefined;
-          if (edge) {
-            pickEntity({ partId, kind: "edge", id: edge.id });
-            return;
-          }
-        }
-        if (faceHits.length > 0) {
-          const hit = faceHits[0];
-          const partId = hit.object.userData.partId as string;
-          const faceId = currentParts.get(partId)?.part.mesh.triangleFaceId[hit.faceIndex ?? 0];
-          if (faceId !== undefined) {
-            pickEntity({ partId, kind: "face", id: faceId });
-            return;
-          }
+      // meaning "get specific" everywhere else (tree panel multi-select).
+      if (ctrlKey) {
+        const target = resolvePickTarget(clientX, clientY);
+        if (target) {
+          clearMultiSelect();
+          pickEntity(target);
+          return;
         }
       }
 
@@ -611,6 +646,12 @@ export function Viewport() {
     }
 
     function onPointerDown(e: PointerEvent) {
+      // Only the left button starts a part drag (or gets treated as a pick on release)
+      // — right-click was falling through to this same handler with no button check at
+      // all, so right-clicking a part armed a drag instead of OrbitControls' own default
+      // right-button pan, which is both surprising and hard to distinguish from an
+      // intentional move.
+      if (e.button !== 0) return;
       pointerDownRef.current = { x: e.clientX, y: e.clientY };
       latestPointerRef.current = { x: e.clientX, y: e.clientY, shiftKey: e.shiftKey };
       armedDragRef.current = null;
@@ -701,10 +742,31 @@ export function Viewport() {
       }
     }
 
+    // Updates the store's hoverEntity to whatever face/edge is under the cursor right
+    // now, while Ctrl/Cmd is held and nothing is armed for a drag/pick gesture — the
+    // preview that lets the user see exactly what they're about to pick before
+    // committing to it. Only writes to the store when the target actually changed, so
+    // ordinary mouse movement within the same face doesn't spam it.
+    function updateHoverPreview(clientX: number, clientY: number, ctrlOrMeta: boolean) {
+      const store = useAssemblyStore.getState();
+      const target = ctrlOrMeta ? resolvePickTarget(clientX, clientY) : null;
+      const cur = store.hoverEntity;
+      const same = cur === target || (!!cur && !!target && cur.partId === target.partId && cur.kind === target.kind && cur.id === target.id);
+      if (!same) store.setHoverEntity(target);
+      return target;
+    }
+
     function onPointerMove(e: PointerEvent) {
       latestPointerRef.current = { x: e.clientX, y: e.clientY, shiftKey: e.shiftKey };
       const armed = armedDragRef.current;
       if (!armed) {
+        const ctrlOrMeta = e.ctrlKey || e.metaKey;
+        const hoverTarget = updateHoverPreview(e.clientX, e.clientY, ctrlOrMeta);
+        if (hoverTarget) {
+          dom.style.cursor = "crosshair";
+          return;
+        }
+
         // Cursor affordance: "grab" over the draggable selected part (or any member of
         // the selected group / multi-selection, when in translate mode), default elsewhere.
         const {
@@ -736,6 +798,7 @@ export function Viewport() {
         dom.style.cursor = hovering ? "grab" : "";
         return;
       }
+      if (useAssemblyStore.getState().hoverEntity) useAssemblyStore.getState().setHoverEntity(null);
 
       if (!armed.dragging) {
         const start = pointerDownRef.current;
@@ -850,9 +913,21 @@ export function Viewport() {
     }
     function onWindowKeyUp(e: KeyboardEvent) {
       heldKeys.delete(e.key.toLowerCase());
+      // Releasing Ctrl/Cmd ends the hover-pick preview immediately, rather than leaving
+      // it visible until the next mousemove happens to notice the key is up.
+      if ((e.key === "Control" || e.key === "Meta") && useAssemblyStore.getState().hoverEntity) {
+        useAssemblyStore.getState().setHoverEntity(null);
+      }
+    }
+    function onWindowBlur() {
+      // Alt-tabbing away, or anything else that steals focus, can eat the keyup — don't
+      // leave a stale hover highlight (or held WASD key) behind.
+      heldKeys.clear();
+      if (useAssemblyStore.getState().hoverEntity) useAssemblyStore.getState().setHoverEntity(null);
     }
     window.addEventListener("keydown", onWindowKeyDown);
     window.addEventListener("keyup", onWindowKeyUp);
+    window.addEventListener("blur", onWindowBlur);
 
     // POV picture-in-picture: when a camera object is selected, its view renders into a
     // corner of the same canvas via a scissored sub-viewport (cheaper than a second
@@ -945,9 +1020,15 @@ export function Viewport() {
     });
     resizeObserver.observe(container);
 
+    function onPointerLeave() {
+      if (useAssemblyStore.getState().hoverEntity) useAssemblyStore.getState().setHoverEntity(null);
+      dom.style.cursor = "";
+    }
+
     dom.addEventListener("pointerdown", onPointerDown);
     dom.addEventListener("pointermove", onPointerMove);
     dom.addEventListener("pointerup", onPointerUp);
+    dom.addEventListener("pointerleave", onPointerLeave);
 
     return () => {
       cancelAnimationFrame(raf);
@@ -955,8 +1036,10 @@ export function Viewport() {
       dom.removeEventListener("pointerdown", onPointerDown);
       dom.removeEventListener("pointermove", onPointerMove);
       dom.removeEventListener("pointerup", onPointerUp);
+      dom.removeEventListener("pointerleave", onPointerLeave);
       window.removeEventListener("keydown", onWindowKeyDown);
       window.removeEventListener("keyup", onWindowKeyUp);
+      window.removeEventListener("blur", onWindowBlur);
       orbit.dispose();
       renderer.dispose();
       container.removeChild(renderer.domElement);
@@ -976,6 +1059,7 @@ export function Viewport() {
     selectedPartId: string | null;
     selectedPartIds: Set<string>;
     pickedEntities: typeof pickedEntities;
+    hoverEntity: EntityRef | null;
     colorMode: typeof colorMode;
   } | null>(null);
 
@@ -996,6 +1080,10 @@ export function Viewport() {
           visual.highlightMesh.geometry.dispose();
           (visual.highlightMesh.material as THREE.Material).dispose();
         }
+        if (visual.hoverMesh) {
+          visual.hoverMesh.geometry.dispose();
+          (visual.hoverMesh.material as THREE.Material).dispose();
+        }
         visuals.delete(id);
       }
     }
@@ -1011,8 +1099,9 @@ export function Viewport() {
       prevDeps.selectedPartId === selectedPartId &&
       prevDeps.selectedPartIds === selectedPartIds &&
       prevDeps.pickedEntities === pickedEntities &&
+      prevDeps.hoverEntity === hoverEntity &&
       prevDeps.colorMode === colorMode;
-    lastReconcileDepsRef.current = { selectedPartId, selectedPartIds, pickedEntities, colorMode };
+    lastReconcileDepsRef.current = { selectedPartId, selectedPartIds, pickedEntities, hoverEntity, colorMode };
 
     partOrder.forEach((id, index) => {
       const state = parts.get(id);
@@ -1046,17 +1135,38 @@ export function Viewport() {
       }
       const pickedFace = pickedEntities.find((e) => e.partId === id && e.kind === "face");
       if (pickedFace) {
-        const overlay = buildFaceHighlight(state.part, pickedFace.id);
+        const overlay = buildFaceHighlight(state.part, pickedFace.id, PICK_COLOR, 0.45);
         if (overlay) {
           visual.group.add(overlay);
           visual.highlightMesh = overlay;
         }
       }
 
+      if (visual.hoverMesh) {
+        visual.group.remove(visual.hoverMesh);
+        visual.hoverMesh.geometry.dispose();
+        (visual.hoverMesh.material as THREE.Material).dispose();
+        visual.hoverMesh = null;
+      }
+      // Skip drawing a hover overlay on top of a face that's already picked — nothing
+      // to preview there, the user already has it, and it would just muddy the color.
+      const hoverFace =
+        hoverEntity && hoverEntity.partId === id && hoverEntity.kind === "face" && hoverEntity.id !== pickedFace?.id
+          ? hoverEntity
+          : null;
+      if (hoverFace) {
+        const overlay = buildFaceHighlight(state.part, hoverFace.id, HOVER_COLOR, 0.35);
+        if (overlay) {
+          visual.group.add(overlay);
+          visual.hoverMesh = overlay;
+        }
+      }
+
       const pickedEdge = pickedEntities.find((e) => e.partId === id && e.kind === "edge");
-      updateEdgeHighlight(visual, state.part, pickedEdge?.id ?? null);
+      const hoverEdge = hoverEntity && hoverEntity.partId === id && hoverEntity.kind === "edge" ? hoverEntity : null;
+      updateEdgeHighlight(visual, state.part, pickedEdge?.id ?? null, hoverEdge?.id ?? null);
     });
-  }, [parts, partOrder, selectedPartId, selectedPartIds, pickedEntities, colorMode]);
+  }, [parts, partOrder, selectedPartId, selectedPartIds, pickedEntities, hoverEntity, colorMode]);
 
   // --- camera projection toggle (ortho <-> perspective) ---
   useEffect(() => {
