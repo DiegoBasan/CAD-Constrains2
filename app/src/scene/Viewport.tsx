@@ -39,7 +39,7 @@ function fitCameraFrustum(camera: SceneCamera, radius: number, aspect: number, r
 interface PartVisual {
   group: THREE.Group;
   mesh: THREE.Mesh;
-  material: THREE.MeshStandardMaterial;
+  material: THREE.MeshStandardMaterial | THREE.MeshBasicMaterial;
   baseColor: number;
   edgeLines: THREE.LineSegments;
   /** Which entry of `part.mesh.edges` each rendered line segment belongs to — a curved
@@ -47,7 +47,80 @@ interface PartVisual {
    * 1:1 index like it would be for straight-only edges. */
   edgeSegmentIndex: Int32Array;
   highlightMesh: THREE.Mesh | null;
+  /** True for a camera object's visual — `mesh` is an invisible pickable proxy (a
+   * camera has no real solid geometry) and `edgeLines` is its frustum gizmo, not real
+   * part edges, so several places (edge-picking, body-color reconciliation) need to
+   * treat it differently from a normal part's visual. */
+  isCamera?: boolean;
 }
+
+const CAMERA_GIZMO_COLOR = 0xffcc55;
+const CAMERA_GIZMO_SELECTED_COLOR = 0x4fa3ff;
+const CAMERA_GIZMO_DEPTH = 22; // mm — how far the frustum's base sits from the apex
+const CAMERA_GIZMO_HALF_W = 13;
+const CAMERA_GIZMO_HALF_H = 9;
+const CAMERA_PROXY_RADIUS = 10; // invisible pickable sphere, so the gizmo is easy to click
+
+// POV picture-in-picture widget size/position (bottom-right corner) — kept in sync with
+// the matching CSS overlay div in the component's JSX.
+const PIP_W = 260;
+const PIP_H = 180;
+const PIP_MARGIN = 12;
+
+/** A camera object's visual: no solid mesh (it has none), just an invisible pickable
+ * proxy sphere (so clicking/dragging works like any other part) plus a wireframe
+ * frustum gizmo — apex at the camera's own origin, base square along local -Z (the
+ * same "forward" convention three.js's own cameras use), matching the little pyramid
+ * icon Blender and similar tools draw for a camera object. */
+function buildCameraVisual(partId: string): PartVisual {
+  const group = new THREE.Group();
+  group.name = partId;
+
+  const proxyGeometry = new THREE.SphereGeometry(CAMERA_PROXY_RADIUS, 8, 6);
+  const proxyMaterial = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false });
+  const mesh = new THREE.Mesh(proxyGeometry, proxyMaterial);
+  mesh.userData.partId = partId;
+  group.add(mesh);
+
+  const z = -CAMERA_GIZMO_DEPTH;
+  const corners: [number, number, number][] = [
+    [-CAMERA_GIZMO_HALF_W, -CAMERA_GIZMO_HALF_H, z],
+    [CAMERA_GIZMO_HALF_W, -CAMERA_GIZMO_HALF_H, z],
+    [CAMERA_GIZMO_HALF_W, CAMERA_GIZMO_HALF_H, z],
+    [-CAMERA_GIZMO_HALF_W, CAMERA_GIZMO_HALF_H, z],
+  ];
+  const apex: [number, number, number] = [0, 0, 0];
+  const segments: [number, number, number][] = [];
+  for (const c of corners) segments.push(apex, c);
+  for (let i = 0; i < 4; i++) segments.push(corners[i], corners[(i + 1) % 4]);
+  const positions = new Float32Array(segments.length * 3);
+  segments.forEach((p, i) => positions.set(p, i * 3));
+  const gizmoGeometry = new THREE.BufferGeometry();
+  gizmoGeometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  const gizmoMaterial = new THREE.LineBasicMaterial({ color: CAMERA_GIZMO_COLOR });
+  const edgeLines = new THREE.LineSegments(gizmoGeometry, gizmoMaterial);
+  edgeLines.userData.partId = partId;
+  group.add(edgeLines);
+
+  return {
+    group,
+    mesh,
+    material: proxyMaterial,
+    baseColor: CAMERA_GIZMO_COLOR,
+    edgeLines,
+    edgeSegmentIndex: new Int32Array(0),
+    highlightMesh: null,
+    isCamera: true,
+  };
+}
+
+/** Which single world axis a translate drag is currently magnetized to, while Shift is
+ * held (Blender-style) — `null` means free movement. Picked once when Shift starts
+ * being held during the drag (whichever axis the raw drag delta at that moment leans
+ * toward most), and re-picked the next time Shift comes back down after being released
+ * mid-drag; live (re-checked every frame), so releasing Shift always returns to free
+ * movement immediately. */
+type SnapAxis = "x" | "y" | "z" | null;
 
 /** An in-progress direct-manipulation drag on the selected part's body — free (not
  * axis-constrained) translate in the camera's view plane, or one of three rotate
@@ -58,12 +131,34 @@ interface PartVisual {
  * so the part tracks the cursor exactly where relations leave it free, and is pulled
  * back only along whatever they actually constrain — in real time, not just on release. */
 type ArmedDrag =
-  | { kind: "translate"; partId: string; dragging: boolean; plane: THREE.Plane; startPoint: THREE.Vector3; startPosition: THREE.Vector3 }
+  | { kind: "translate"; partId: string; dragging: boolean; plane: THREE.Plane; startPoint: THREE.Vector3; startPosition: THREE.Vector3; snapAxis: SnapAxis }
   | { kind: "rotate"; partId: string; dragging: boolean; pivotMode: RotatePivotMode; lastScreen: THREE.Vector2 }
-  // Dragging a selected group: translate-only (see store.applyGroupDragPreview) — every
-  // member is offset by the same rigid delta from its own start position, and each one
-  // still resists independently wherever its own relations constrain it.
-  | { kind: "translateGroup"; groupId: string; dragging: boolean; plane: THREE.Plane; startPoint: THREE.Vector3; startPositions: Map<string, THREE.Vector3> };
+  // Dragging a selected group, or an ad-hoc multi-selection: translate-only (see
+  // store.applyGroupDragPreview) — every member is offset by the same rigid delta from
+  // its own start position, and each one still resists independently wherever its own
+  // relations constrain it.
+  | { kind: "translateGroup"; dragging: boolean; plane: THREE.Plane; startPoint: THREE.Vector3; startPositions: Map<string, THREE.Vector3>; snapAxis: SnapAxis };
+
+/** Applies (or clears) Shift-held axis-snap to a raw drag delta — see `SnapAxis`. Reads
+ * and writes `armed.snapAxis` in place (picking a new axis on Shift's rising edge,
+ * clearing it the instant Shift is released) and returns the delta to actually apply. */
+function applyAxisSnap(armed: { snapAxis: SnapAxis }, rawDelta: THREE.Vector3, shiftHeld: boolean): THREE.Vector3 {
+  if (!shiftHeld) {
+    armed.snapAxis = null;
+    return rawDelta;
+  }
+  if (!armed.snapAxis) {
+    const ax = Math.abs(rawDelta.x);
+    const ay = Math.abs(rawDelta.y);
+    const az = Math.abs(rawDelta.z);
+    armed.snapAxis = ax >= ay && ax >= az ? "x" : ay >= az ? "y" : "z";
+  }
+  return new THREE.Vector3(
+    armed.snapAxis === "x" ? rawDelta.x : 0,
+    armed.snapAxis === "y" ? rawDelta.y : 0,
+    armed.snapAxis === "z" ? rawDelta.z : 0,
+  );
+}
 
 // Below this many screen pixels from the rotation center, a screen-angle-based
 // rotation (part-spin and free-arcball modes) becomes numerically unstable — a tiny
@@ -226,6 +321,9 @@ function buildFaceHighlight(part: ImportedPart, faceId: number): THREE.Mesh | nu
 }
 
 function updateEdgeHighlight(visual: PartVisual, part: ImportedPart, highlightedEdgeId: number | null): void {
+  // A camera's gizmo geometry has no per-vertex "color" attribute (it's a single flat
+  // LineBasicMaterial color, not vertex-colored real edges) — nothing to highlight.
+  if (visual.isCamera) return;
   const colorAttr = visual.edgeLines.geometry.getAttribute("color") as THREE.BufferAttribute;
   const normal = new THREE.Color(EDGE_COLOR);
   const highlight = new THREE.Color(EDGE_HIGHLIGHT_COLOR);
@@ -247,7 +345,7 @@ export function Viewport() {
   const visualsRef = useRef<Map<string, PartVisual>>(new Map());
   const pointerDownRef = useRef<{ x: number; y: number } | null>(null);
   const armedDragRef = useRef<ArmedDrag | null>(null);
-  const latestPointerRef = useRef<{ x: number; y: number } | null>(null);
+  const latestPointerRef = useRef<{ x: number; y: number; shiftKey: boolean } | null>(null);
   const viewSizeRef = useRef(200);
   const switchCameraRef = useRef<((kind: CameraProjection) => void) | null>(null);
   const setFovRef = useRef<((fov: number) => void) | null>(null);
@@ -257,6 +355,7 @@ export function Viewport() {
   const parts = useAssemblyStore((s) => s.parts);
   const partOrder = useAssemblyStore((s) => s.partOrder);
   const selectedPartId = useAssemblyStore((s) => s.selectedPartId);
+  const selectedPartIds = useAssemblyStore((s) => s.selectedPartIds);
   const pickedEntities = useAssemblyStore((s) => s.pickedEntities);
   const requestedView = useAssemblyStore((s) => s.requestedView);
   const consumeRequestedView = useAssemblyStore((s) => s.consumeRequestedView);
@@ -448,14 +547,36 @@ export function Viewport() {
       return raycaster;
     }
 
-    function pick(clientX: number, clientY: number) {
+    function pick(clientX: number, clientY: number, shiftKey: boolean) {
       const rc = raycasterFromEvent(clientX, clientY);
       if (!rc) return;
 
-      const { parts: currentParts, pickEntity, selectPart } = useAssemblyStore.getState();
+      const { parts: currentParts, pickEntity, selectPart, toggleMultiSelect, clearMultiSelect } = useAssemblyStore.getState();
       const visuals = Array.from(visualsRef.current.values());
 
       const lineHits = rc.intersectObjects(visuals.map((v) => v.edgeLines), false);
+      const faceHits = rc.intersectObjects(visuals.map((v) => v.mesh), false);
+
+      if (shiftKey) {
+        // Shift-click always selects the whole object, never a single face/edge — that's
+        // the point of the distinction from a plain click, which feeds the two-pick
+        // relation flow below.
+        const hit = lineHits[0] ?? faceHits[0];
+        const partId = hit ? (hit.object.userData.partId as string) : undefined;
+        if (partId) toggleMultiSelect(partId);
+        return;
+      }
+      clearMultiSelect();
+
+      // A camera object has no faces/edges to resolve a pick against — a plain click on
+      // its proxy sphere or frustum gizmo just selects the whole object, the same as a
+      // shift-click would (it just also can't participate in the two-pick relation flow).
+      const hitPartId = (lineHits[0] ?? faceHits[0])?.object.userData.partId as string | undefined;
+      if (hitPartId && currentParts.get(hitPartId)?.isCamera) {
+        selectPart(hitPartId);
+        return;
+      }
+
       if (lineHits.length > 0) {
         const hit = lineHits[0];
         const partId = hit.object.userData.partId as string;
@@ -468,7 +589,6 @@ export function Viewport() {
         }
       }
 
-      const faceHits = rc.intersectObjects(visuals.map((v) => v.mesh), false);
       if (faceHits.length > 0) {
         const hit = faceHits[0];
         const partId = hit.object.userData.partId as string;
@@ -483,17 +603,33 @@ export function Viewport() {
 
     function onPointerDown(e: PointerEvent) {
       pointerDownRef.current = { x: e.clientX, y: e.clientY };
-      latestPointerRef.current = { x: e.clientX, y: e.clientY };
+      latestPointerRef.current = { x: e.clientX, y: e.clientY, shiftKey: e.shiftKey };
       armedDragRef.current = null;
 
-      const { selectedPartId: selId, selectedGroupId: selGroupId, parts: currentParts, transformMode, rotatePivotMode } = useAssemblyStore.getState();
+      const {
+        selectedPartId: selId,
+        selectedGroupId: selGroupId,
+        selectedPartIds,
+        parts: currentParts,
+        transformMode,
+        rotatePivotMode,
+      } = useAssemblyStore.getState();
 
-      if (selGroupId && transformMode === "translate") {
-        const memberIds = Array.from(currentParts.entries())
-          .filter(([, st]) => st.groupId === selGroupId && !st.fixed)
-          .map(([id]) => id);
+      // A named group drags every member; an ad-hoc multi-selection (2+ parts,
+      // Ctrl/Cmd-click in the tree or Shift-click in the viewport) drags the same way
+      // without needing to actually group them first — both go through the same rigid
+      // multi-part drag (store.applyGroupDragPreview cares only about the id list).
+      const multiIds = selGroupId
+        ? Array.from(currentParts.entries())
+            .filter(([, st]) => st.groupId === selGroupId && !st.fixed)
+            .map(([id]) => id)
+        : selectedPartIds.size >= 2
+          ? Array.from(selectedPartIds).filter((id) => !currentParts.get(id)?.fixed)
+          : null;
+
+      if (multiIds && transformMode === "translate") {
         const rc = raycasterFromEvent(e.clientX, e.clientY);
-        const hitMemberId = rc && memberIds.find((id) => {
+        const hitMemberId = rc && multiIds.find((id) => {
           const v = visualsRef.current.get(id);
           return v && rc.intersectObject(v.mesh, false).length > 0;
         });
@@ -505,12 +641,12 @@ export function Viewport() {
           const startPoint = new THREE.Vector3();
           if (rc.ray.intersectPlane(plane, startPoint)) {
             const startPositions = new Map<string, THREE.Vector3>();
-            for (const id of memberIds) {
+            for (const id of multiIds) {
               const v = visualsRef.current.get(id);
               if (v) startPositions.set(id, v.group.position.clone());
             }
             orbit.enabled = false;
-            armedDragRef.current = { kind: "translateGroup", groupId: selGroupId, dragging: false, plane, startPoint, startPositions };
+            armedDragRef.current = { kind: "translateGroup", dragging: false, plane, startPoint, startPositions, snapAxis: null };
           }
           return;
         }
@@ -542,6 +678,7 @@ export function Viewport() {
           plane,
           startPoint,
           startPosition: visual.group.position.clone(),
+          snapAxis: null,
         };
       } else {
         const rect = containerRef.current!.getBoundingClientRect();
@@ -556,17 +693,28 @@ export function Viewport() {
     }
 
     function onPointerMove(e: PointerEvent) {
-      latestPointerRef.current = { x: e.clientX, y: e.clientY };
+      latestPointerRef.current = { x: e.clientX, y: e.clientY, shiftKey: e.shiftKey };
       const armed = armedDragRef.current;
       if (!armed) {
-        // Cursor affordance: "grab" over the draggable selected part (or any member of the
-        // selected group, when in translate mode), default elsewhere.
-        const { selectedPartId: selId, selectedGroupId: selGroupId, parts: currentParts, transformMode: mode } = useAssemblyStore.getState();
+        // Cursor affordance: "grab" over the draggable selected part (or any member of
+        // the selected group / multi-selection, when in translate mode), default elsewhere.
+        const {
+          selectedPartId: selId,
+          selectedGroupId: selGroupId,
+          selectedPartIds,
+          parts: currentParts,
+          transformMode: mode,
+        } = useAssemblyStore.getState();
         let hovering = false;
-        if (selGroupId && mode === "translate") {
+        const multiIds = selGroupId
+          ? Array.from(currentParts.entries()).filter(([, st]) => st.groupId === selGroupId && !st.fixed).map(([id]) => id)
+          : selectedPartIds.size >= 2
+            ? Array.from(selectedPartIds)
+            : null;
+        if (multiIds && mode === "translate") {
           const rc = raycasterFromEvent(e.clientX, e.clientY);
-          hovering = !!rc && Array.from(currentParts.entries()).some(
-            ([id, st]) => st.groupId === selGroupId && !st.fixed && (visualsRef.current.get(id)?.mesh ? rc.intersectObject(visualsRef.current.get(id)!.mesh, false).length > 0 : false),
+          hovering = !!rc && multiIds.some(
+            (id) => !currentParts.get(id)?.fixed && (visualsRef.current.get(id)?.mesh ? rc.intersectObject(visualsRef.current.get(id)!.mesh, false).length > 0 : false),
           );
         }
         if (!hovering && selId) {
@@ -607,7 +755,7 @@ export function Viewport() {
         if (!rc) return;
         const hit = new THREE.Vector3();
         if (!rc.ray.intersectPlane(armed.plane, hit)) return;
-        const delta = hit.sub(armed.startPoint);
+        const delta = applyAxisSnap(armed, hit.sub(armed.startPoint), pointer.shiftKey);
         const patches = Array.from(armed.startPositions.entries()).map(([partId, startPosition]) => {
           const target = startPosition.clone().add(delta);
           return { partId, position: [target.x, target.y, target.z] as [number, number, number] };
@@ -626,7 +774,8 @@ export function Viewport() {
         if (!rc) return;
         const hit = new THREE.Vector3();
         if (!rc.ray.intersectPlane(armed.plane, hit)) return;
-        const target = armed.startPosition.clone().add(hit.sub(armed.startPoint));
+        const delta = applyAxisSnap(armed, hit.sub(armed.startPoint), pointer.shiftKey);
+        const target = armed.startPosition.clone().add(delta);
         store.applyDragPreview(armed.partId, { position: [target.x, target.y, target.z] });
         return;
       }
@@ -671,7 +820,7 @@ export function Viewport() {
       pointerDownRef.current = null;
       if (!start) return;
       if (Math.hypot(e.clientX - start.x, e.clientY - start.y) > 4) return;
-      pick(e.clientX, e.clientY);
+      pick(e.clientX, e.clientY, e.shiftKey);
     }
 
     // WASD camera orbit — an alternative to dragging on empty space to orbit: W/S tilt
@@ -695,6 +844,36 @@ export function Viewport() {
     }
     window.addEventListener("keydown", onWindowKeyDown);
     window.addEventListener("keyup", onWindowKeyUp);
+
+    // POV picture-in-picture: when a camera object is selected, its view renders into a
+    // corner of the same canvas via a scissored sub-viewport (cheaper than a second
+    // WebGL context) right after the main render — see the bottom-right overlay div in
+    // the JSX for the matching border/label.
+    const povCamera = new THREE.PerspectiveCamera(50, PIP_W / PIP_H, 0.1, 100000);
+    function renderPovWidget(w: number, h: number) {
+      const { selectedPartId: selId, parts: currentParts } = useAssemblyStore.getState();
+      const camState = selId ? currentParts.get(selId) : undefined;
+      if (!camState?.isCamera) return;
+      const visual = visualsRef.current.get(selId!);
+      if (!visual) return;
+
+      povCamera.position.copy(visual.group.position);
+      povCamera.quaternion.copy(visual.group.quaternion);
+      povCamera.fov = camState.cameraFov ?? 50;
+      povCamera.updateProjectionMatrix();
+
+      const pipX = w - PIP_W - PIP_MARGIN;
+      const pipY = PIP_MARGIN; // WebGL viewport/scissor Y is bottom-up, matching the CSS `bottom` offset used for the overlay
+      visual.edgeLines.visible = false; // don't let the camera see its own gizmo
+      renderer.setScissorTest(true);
+      renderer.setScissor(pipX, pipY, PIP_W, PIP_H);
+      renderer.setViewport(pipX, pipY, PIP_W, PIP_H);
+      renderer.clearDepth();
+      renderer.render(scene, povCamera);
+      visual.edgeLines.visible = true;
+      renderer.setScissorTest(false);
+      renderer.setViewport(0, 0, w, h);
+    }
 
     let raf = 0;
     let lastFrameTime = performance.now();
@@ -729,6 +908,8 @@ export function Viewport() {
       orbit.update();
       processDragFrame();
       renderer.render(scene, camera);
+      const el = containerRef.current;
+      if (el && el.clientWidth > 0 && el.clientHeight > 0) renderPovWidget(el.clientWidth, el.clientHeight);
       raf = requestAnimationFrame(animate);
     };
     raf = requestAnimationFrame(animate);
@@ -792,15 +973,22 @@ export function Viewport() {
       if (!state) return;
       let visual = visuals.get(id);
       if (!visual) {
-        visual = buildPartVisual(state.part, partColor(index));
+        visual = state.isCamera ? buildCameraVisual(id) : buildPartVisual(state.part, partColor(index));
         scene.add(visual.group);
         visuals.set(id, visual);
       }
       visual.group.position.set(...state.pose.position);
       visual.group.quaternion.set(...state.pose.quaternion);
       visual.group.visible = state.visible;
-      const bodyColor = colorMode === "gray" ? UNIFORM_GRAY_COLOR : visual.baseColor;
-      visual.material.color.setHex(id === selectedPartId ? SELECTED_PART_COLOR : bodyColor);
+      const isSelected = id === selectedPartId || selectedPartIds.has(id);
+      if (visual.isCamera) {
+        (visual.edgeLines.material as THREE.LineBasicMaterial).color.setHex(
+          isSelected ? CAMERA_GIZMO_SELECTED_COLOR : CAMERA_GIZMO_COLOR,
+        );
+      } else {
+        const bodyColor = state.color ?? (colorMode === "gray" ? UNIFORM_GRAY_COLOR : visual.baseColor);
+        visual.material.color.setHex(isSelected ? SELECTED_PART_COLOR : bodyColor);
+      }
 
       if (visual.highlightMesh) {
         visual.group.remove(visual.highlightMesh);
@@ -820,7 +1008,7 @@ export function Viewport() {
       const pickedEdge = pickedEntities.find((e) => e.partId === id && e.kind === "edge");
       updateEdgeHighlight(visual, state.part, pickedEdge?.id ?? null);
     });
-  }, [parts, partOrder, selectedPartId, pickedEntities, colorMode]);
+  }, [parts, partOrder, selectedPartId, selectedPartIds, pickedEntities, colorMode]);
 
   // --- camera projection toggle (ortho <-> perspective) ---
   useEffect(() => {
@@ -857,5 +1045,30 @@ export function Viewport() {
     return () => cancelAnimationFrame(raf);
   }, [importVersion]);
 
-  return <div ref={containerRef} className="h-full w-full" />;
+  const povCameraState = selectedPartId ? parts.get(selectedPartId) : undefined;
+  return (
+    <div className="relative h-full w-full">
+      <div ref={containerRef} className="h-full w-full" />
+      {povCameraState?.isCamera && (
+        <div
+          className="pointer-events-none absolute overflow-hidden rounded"
+          style={{
+            width: PIP_W,
+            height: PIP_H,
+            right: PIP_MARGIN,
+            bottom: PIP_MARGIN,
+            border: "1px solid #ffcc55",
+            boxShadow: "0 2px 10px rgba(0,0,0,0.5)",
+          }}
+        >
+          <span
+            className="absolute left-1 top-1 rounded px-1 text-[10px] font-medium"
+            style={{ background: "rgba(0,0,0,0.55)", color: "#ffcc55" }}
+          >
+            POV · {povCameraState.part.name}
+          </span>
+        </div>
+      )}
+    </div>
+  );
 }

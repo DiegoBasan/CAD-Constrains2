@@ -6,6 +6,7 @@ import type { EntityRef } from "../occ/types";
 const NEEDS_VALUE: Partial<Record<RelationType, boolean>> = { distance: true, planar: true };
 
 function entityLabel(ref: EntityRef, partName: string | undefined): string {
+  if (ref.kind === "part") return partName ?? "?";
   return `${partName ?? "?"} · ${ref.kind === "face" ? "cara" : "arista"} #${ref.id}`;
 }
 
@@ -27,14 +28,16 @@ function RelationSideRow({
       <span className="truncate" style={{ color: "var(--text-dim)" }}>
         {entityLabel(ref, parts.get(ref.partId)?.part.name)}
       </span>
-      <button
-        title={`Cambiar la cara/arista ${side.toUpperCase()}`}
-        onClick={() => startEditRelationSide(rel.id, side)}
-        className="shrink-0 rounded px-1 text-[11px] hover:opacity-80"
-        style={{ color: isEditingThis ? "var(--warn)" : "var(--text-dim)" }}
-      >
-        {isEditingThis ? "…esperando clic" : "✎ cambiar"}
-      </button>
+      {rel.type !== "rigid" && (
+        <button
+          title={`Cambiar la cara/arista ${side.toUpperCase()}`}
+          onClick={() => startEditRelationSide(rel.id, side)}
+          className="shrink-0 rounded px-1 text-[11px] hover:opacity-80"
+          style={{ color: isEditingThis ? "var(--warn)" : "var(--text-dim)" }}
+        >
+          {isEditingThis ? "…esperando clic" : "✎ cambiar"}
+        </button>
+      )}
     </div>
   );
 }

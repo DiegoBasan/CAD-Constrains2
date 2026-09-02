@@ -1,5 +1,6 @@
 import { useAssemblyStore, type ViewPreset, type CameraProjection, type ColorMode, type TransformMode, type RotatePivotMode } from "../assembly/store";
 import { ImportButton } from "./ImportButton";
+import { ProjectPanel } from "./ProjectPanel";
 
 const VIEWS: { id: ViewPreset; label: string }[] = [
   { id: "iso", label: "ISO" },
@@ -85,6 +86,10 @@ export function Toolbar() {
       </div>
 
       <ImportButton />
+
+      <div className="pl-1" style={{ borderLeft: "1px solid var(--border)" }}>
+        <ProjectPanel />
+      </div>
 
       <div className="flex items-center gap-1 pl-1" style={{ borderLeft: "1px solid var(--border)" }}>
         {VIEWS.map((v) => (

@@ -1,14 +1,14 @@
 import * as THREE from "three";
 import type { EntityRef, ImportedPart, Pose, Quat } from "../occ/types";
 
-export type RelationType = "coincident" | "concentric" | "planar" | "distance" | "parallel";
+export type RelationType = "coincident" | "concentric" | "planar" | "distance" | "parallel" | "rigid";
 
 export interface Relation {
   id: string;
   type: RelationType;
   a: EntityRef;
   b: EntityRef;
-  /** Meaning depends on type: planar/distance offset, both in mm. Ignored for concentric/parallel. */
+  /** Meaning depends on type: planar/distance offset, both in mm. Ignored for concentric/parallel/rigid. */
   value: number;
   /** Only meaningful for "planar": false (default) = faces flush facing each other
    * (normals anti-parallel); true = faces facing the same way (normals parallel). */
@@ -21,6 +21,10 @@ export interface Relation {
   angleMax?: number;
   refQuatA?: Quat;
   refQuatB?: Quat;
+  /** Only for "rigid": B's pose relative to A's, captured at the moment the relation was
+   * created (B expressed in A's local frame) — enforced going forward however A moves,
+   * i.e. "weld B to A" rather than aligning any particular feature. See relationResiduals. */
+  rigidOffset?: { position: [number, number, number]; quaternion: Quat };
 }
 
 export const RELATION_LABELS: Record<RelationType, string> = {
@@ -29,6 +33,7 @@ export const RELATION_LABELS: Record<RelationType, string> = {
   planar: "Plana (flush)",
   distance: "Distancia",
   parallel: "Paralela",
+  rigid: "Vincular (rígida)",
 };
 
 export interface ResolvedEntity {
@@ -58,6 +63,14 @@ export function resolveEntity(part: ImportedPart, ref: EntityRef, pose: Pose): R
   const m = poseMatrix(pose);
   const normalMatrix = new THREE.Matrix3().getNormalMatrix(m);
   const quaternion = new THREE.Quaternion(...pose.quaternion);
+
+  if (ref.kind === "part") {
+    // The whole part's own origin/orientation — no feature lookup needed, so this
+    // resolves even for a part with no faces/edges at all (e.g. a camera object).
+    const point = new THREE.Vector3(0, 0, 0).applyMatrix4(m);
+    const direction = new THREE.Vector3(0, 0, 1).applyMatrix3(normalMatrix).normalize();
+    return { point, direction, isAxis: false, quaternion };
+  }
 
   if (ref.kind === "face") {
     const face = part.mesh.faces.find((f) => f.id === ref.id);
@@ -152,6 +165,23 @@ export function relationResiduals(
     case "distance": {
       const dist = a.point.distanceTo(b.point) - relation.value;
       return [dist];
+    }
+    case "rigid": {
+      // Weld B to A: B should sit exactly `rigidOffset` away from A, in A's own local
+      // frame, however A itself has moved — i.e. B rigidly follows A's translation
+      // *and* rotation, like they were the same object. Position residual is the
+      // straightforward offset mismatch; orientation residual is the (small-angle-
+      // linearized) imaginary part of the mismatch quaternion, the same trick the exp-map
+      // step parametrization elsewhere in the solver relies on — it's a valid local
+      // model near zero, which is all Gauss-Newton needs, and it's exactly zero only
+      // when the two orientations truly match.
+      const offset = relation.rigidOffset!;
+      const predictedPos = new THREE.Vector3(...offset.position).applyQuaternion(a.quaternion).add(a.point);
+      const posResidual = new THREE.Vector3().subVectors(b.point, predictedPos);
+      const offsetQuat = new THREE.Quaternion(...offset.quaternion);
+      const predictedQuat = a.quaternion.clone().multiply(offsetQuat);
+      const mismatch = b.quaternion.clone().multiply(predictedQuat.clone().invert());
+      return [posResidual.x, posResidual.y, posResidual.z, 2 * mismatch.x, 2 * mismatch.y, 2 * mismatch.z];
     }
   }
 }
