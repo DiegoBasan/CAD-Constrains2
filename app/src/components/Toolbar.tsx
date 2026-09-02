@@ -1,4 +1,4 @@
-import { useAssemblyStore, type ViewPreset, type TransformMode, type RotatePivotMode } from "../assembly/store";
+import { useAssemblyStore, type ViewPreset, type CameraProjection, type TransformMode, type RotatePivotMode } from "../assembly/store";
 import { ImportButton } from "./ImportButton";
 
 const VIEWS: { id: ViewPreset; label: string }[] = [
@@ -6,6 +6,11 @@ const VIEWS: { id: ViewPreset; label: string }[] = [
   { id: "front", label: "Frontal" },
   { id: "top", label: "Superior" },
   { id: "right", label: "Derecha" },
+];
+
+const PROJECTIONS: { id: CameraProjection; label: string; title: string }[] = [
+  { id: "ortho", label: "Ortográfica", title: "Proyección ortográfica (sin perspectiva)" },
+  { id: "perspective", label: "Perspectiva", title: "Proyección en perspectiva" },
 ];
 
 const MODES: { id: TransformMode; label: string }[] = [
@@ -54,6 +59,8 @@ export function Toolbar() {
   const setTransformMode = useAssemblyStore((s) => s.setTransformMode);
   const rotatePivotMode = useAssemblyStore((s) => s.rotatePivotMode);
   const setRotatePivotMode = useAssemblyStore((s) => s.setRotatePivotMode);
+  const cameraProjection = useAssemblyStore((s) => s.cameraProjection);
+  const setCameraProjection = useAssemblyStore((s) => s.setCameraProjection);
   const fileNames = useAssemblyStore((s) => s.fileNames);
   const partCount = useAssemblyStore((s) => s.partOrder.length);
 
@@ -74,6 +81,20 @@ export function Toolbar() {
         {VIEWS.map((v) => (
           <ToolbarButton key={v.id} onClick={() => requestView(v.id)}>
             {v.label}
+          </ToolbarButton>
+        ))}
+      </div>
+
+      <div className="flex items-center gap-1 pl-3" style={{ borderLeft: "1px solid var(--border)" }}>
+        {PROJECTIONS.map((p) => (
+          <ToolbarButton
+            key={p.id}
+            small
+            title={p.title}
+            active={cameraProjection === p.id}
+            onClick={() => setCameraProjection(p.id)}
+          >
+            {p.label}
           </ToolbarButton>
         ))}
       </div>

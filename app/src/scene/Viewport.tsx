@@ -1,10 +1,42 @@
 import { useEffect, useRef } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
-import { useAssemblyStore, type RotatePivotMode } from "../assembly/store";
+import { useAssemblyStore, type CameraProjection, type RotatePivotMode } from "../assembly/store";
 import type { ImportedPart } from "../occ/types";
 import { EDGE_COLOR, EDGE_HIGHLIGHT_COLOR, PICK_COLOR, SELECTED_PART_COLOR, partColor } from "./colors";
 import { applyViewPreset } from "./viewPresets";
+
+type SceneCamera = THREE.OrthographicCamera | THREE.PerspectiveCamera;
+
+const PERSPECTIVE_FOV = 50;
+
+/** How far the camera needs to sit from `target` to frame a sphere of `radius` —
+ * for orthographic the visible extent comes from left/right/top/bottom instead, so
+ * distance only needs to keep the content between the near/far clip planes; for
+ * perspective, distance is what actually controls the framing. */
+function fitDistance(camera: SceneCamera, radius: number): number {
+  if (camera instanceof THREE.PerspectiveCamera) {
+    return radius / Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
+  }
+  return radius * 3;
+}
+
+/** Sizes the camera's frustum to frame a sphere of `radius` at the given aspect ratio —
+ * for orthographic this is the actual left/right/top/bottom; for perspective the FOV
+ * stays fixed and framing instead comes entirely from the camera's distance (see
+ * fitDistance), so this only needs to keep the aspect ratio in sync here. */
+function fitCameraFrustum(camera: SceneCamera, radius: number, aspect: number, resetZoom = true): void {
+  if (camera instanceof THREE.OrthographicCamera) {
+    camera.top = radius;
+    camera.bottom = -radius;
+    camera.left = -radius * aspect;
+    camera.right = radius * aspect;
+  } else {
+    camera.aspect = aspect;
+  }
+  if (resetZoom) camera.zoom = 1;
+  camera.updateProjectionMatrix();
+}
 
 interface PartVisual {
   group: THREE.Group;
@@ -12,6 +44,10 @@ interface PartVisual {
   material: THREE.MeshStandardMaterial;
   baseColor: number;
   edgeLines: THREE.LineSegments;
+  /** Which entry of `part.mesh.edges` each rendered line segment belongs to — a curved
+   * edge is drawn as several segments (see EdgeInfo.polyline), so this isn't a plain
+   * 1:1 index like it would be for straight-only edges. */
+  edgeSegmentIndex: Int32Array;
   highlightMesh: THREE.Mesh | null;
 }
 
@@ -25,7 +61,11 @@ interface PartVisual {
  * back only along whatever they actually constrain — in real time, not just on release. */
 type ArmedDrag =
   | { kind: "translate"; partId: string; dragging: boolean; plane: THREE.Plane; startPoint: THREE.Vector3; startPosition: THREE.Vector3 }
-  | { kind: "rotate"; partId: string; dragging: boolean; pivotMode: RotatePivotMode; lastScreen: THREE.Vector2 };
+  | { kind: "rotate"; partId: string; dragging: boolean; pivotMode: RotatePivotMode; lastScreen: THREE.Vector2 }
+  // Dragging a selected group: translate-only (see store.applyGroupDragPreview) — every
+  // member is offset by the same rigid delta from its own start position, and each one
+  // still resists independently wherever its own relations constrain it.
+  | { kind: "translateGroup"; groupId: string; dragging: boolean; plane: THREE.Plane; startPoint: THREE.Vector3; startPositions: Map<string, THREE.Vector3> };
 
 // Below this many screen pixels from the rotation center, a screen-angle-based
 // rotation (part-spin and free-arcball modes) becomes numerically unstable — a tiny
@@ -37,7 +77,7 @@ const MIN_PIVOT_RADIUS = 14;
 const CAMERA_ORBIT_SENSITIVITY = 0.008; // rad per pixel of drag
 
 function computeRotatePart(
-  camera: THREE.OrthographicCamera,
+  camera: SceneCamera,
   rect: DOMRect,
   curPos: THREE.Vector3,
   curQuat: THREE.Quaternion,
@@ -61,7 +101,7 @@ function computeRotatePart(
 }
 
 function computeRotateCamera(
-  camera: THREE.OrthographicCamera,
+  camera: SceneCamera,
   orbitTarget: THREE.Vector3,
   curPos: THREE.Vector3,
   curQuat: THREE.Quaternion,
@@ -80,7 +120,7 @@ function computeRotateCamera(
 }
 
 function computeRotateFree(
-  camera: THREE.OrthographicCamera,
+  camera: SceneCamera,
   rect: DOMRect,
   curPos: THREE.Vector3,
   curQuat: THREE.Quaternion,
@@ -135,13 +175,22 @@ function buildPartVisual(part: ImportedPart, color: number): PartVisual {
   mesh.userData.partId = part.id;
   group.add(mesh);
 
-  const edgeCount = part.mesh.edges.length;
-  const edgePositions = new Float32Array(edgeCount * 6);
-  const edgeColors = new Float32Array(edgeCount * 6);
+  // Each edge draws as a polyline of one or more straight segments (curved edges get
+  // several — see EdgeInfo.polyline) concatenated into one LineSegments geometry, so
+  // track which source edge each pair of vertices came from for picking/highlighting.
+  const totalSegments = part.mesh.edges.reduce((sum, e) => sum + Math.max(0, e.polyline.length - 1), 0);
+  const edgePositions = new Float32Array(totalSegments * 6);
+  const edgeColors = new Float32Array(totalSegments * 6);
+  const edgeSegmentIndex = new Int32Array(totalSegments);
   const baseColor = new THREE.Color(EDGE_COLOR);
-  part.mesh.edges.forEach((edge, i) => {
-    edgePositions.set([...edge.a, ...edge.b], i * 6);
-    edgeColors.set([baseColor.r, baseColor.g, baseColor.b, baseColor.r, baseColor.g, baseColor.b], i * 6);
+  let seg = 0;
+  part.mesh.edges.forEach((edge, edgeIdx) => {
+    for (let i = 0; i < edge.polyline.length - 1; i++) {
+      edgePositions.set([...edge.polyline[i], ...edge.polyline[i + 1]], seg * 6);
+      edgeColors.set([baseColor.r, baseColor.g, baseColor.b, baseColor.r, baseColor.g, baseColor.b], seg * 6);
+      edgeSegmentIndex[seg] = edgeIdx;
+      seg++;
+    }
   });
   const edgeGeometry = new THREE.BufferGeometry();
   edgeGeometry.setAttribute("position", new THREE.BufferAttribute(edgePositions, 3));
@@ -151,7 +200,7 @@ function buildPartVisual(part: ImportedPart, color: number): PartVisual {
   edgeLines.userData.partId = part.id;
   group.add(edgeLines);
 
-  return { group, mesh, material, baseColor: color, edgeLines, highlightMesh: null };
+  return { group, mesh, material, baseColor: color, edgeLines, edgeSegmentIndex, highlightMesh: null };
 }
 
 function buildFaceHighlight(part: ImportedPart, faceId: number): THREE.Mesh | null {
@@ -182,18 +231,19 @@ function updateEdgeHighlight(visual: PartVisual, part: ImportedPart, highlighted
   const colorAttr = visual.edgeLines.geometry.getAttribute("color") as THREE.BufferAttribute;
   const normal = new THREE.Color(EDGE_COLOR);
   const highlight = new THREE.Color(EDGE_HIGHLIGHT_COLOR);
-  part.mesh.edges.forEach((edge, i) => {
-    const c = edge.id === highlightedEdgeId ? highlight : normal;
-    colorAttr.setXYZ(i * 2, c.r, c.g, c.b);
-    colorAttr.setXYZ(i * 2 + 1, c.r, c.g, c.b);
-  });
+  for (let seg = 0; seg < visual.edgeSegmentIndex.length; seg++) {
+    const edge = part.mesh.edges[visual.edgeSegmentIndex[seg]];
+    const c = edge?.id === highlightedEdgeId ? highlight : normal;
+    colorAttr.setXYZ(seg * 2, c.r, c.g, c.b);
+    colorAttr.setXYZ(seg * 2 + 1, c.r, c.g, c.b);
+  }
   colorAttr.needsUpdate = true;
 }
 
 export function Viewport() {
   const containerRef = useRef<HTMLDivElement>(null);
   const sceneRef = useRef<THREE.Scene | null>(null);
-  const cameraRef = useRef<THREE.OrthographicCamera | null>(null);
+  const cameraRef = useRef<SceneCamera | null>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const orbitRef = useRef<OrbitControls | null>(null);
   const visualsRef = useRef<Map<string, PartVisual>>(new Map());
@@ -201,6 +251,7 @@ export function Viewport() {
   const armedDragRef = useRef<ArmedDrag | null>(null);
   const latestPointerRef = useRef<{ x: number; y: number } | null>(null);
   const viewSizeRef = useRef(200);
+  const switchCameraRef = useRef<((kind: CameraProjection) => void) | null>(null);
 
   const parts = useAssemblyStore((s) => s.parts);
   const partOrder = useAssemblyStore((s) => s.partOrder);
@@ -209,6 +260,10 @@ export function Viewport() {
   const requestedView = useAssemblyStore((s) => s.requestedView);
   const consumeRequestedView = useAssemblyStore((s) => s.consumeRequestedView);
   const importVersion = useAssemblyStore((s) => s.importVersion);
+  const cameraProjection = useAssemblyStore((s) => s.cameraProjection);
+  // Read once as the initial camera-kind seed on mount; later changes are picked up by the
+  // separate switchCameraRef-driven effect below, not by re-running scene setup.
+  const initialProjectionRef = useRef(cameraProjection);
 
   // --- one-time scene setup ---
   useEffect(() => {
@@ -222,10 +277,19 @@ export function Viewport() {
     const width = container.clientWidth || 1;
     const height = container.clientHeight || 1;
     const aspect = width / height;
-    const viewSize = viewSizeRef.current;
-    const camera = new THREE.OrthographicCamera(
-      -viewSize * aspect, viewSize * aspect, viewSize, -viewSize, -100000, 100000,
-    );
+
+    function makeOrthoCamera(): THREE.OrthographicCamera {
+      const viewSize = viewSizeRef.current;
+      return new THREE.OrthographicCamera(-viewSize * aspect, viewSize * aspect, viewSize, -viewSize, -100000, 100000);
+    }
+    function makePerspectiveCamera(): THREE.PerspectiveCamera {
+      return new THREE.PerspectiveCamera(PERSPECTIVE_FOV, aspect, 0.1, 100000);
+    }
+
+    // `camera`/`orbit` are reassigned (not just mutated) when the projection mode
+    // toggles — every function below closes over these same outer bindings, so a
+    // reassignment here is picked up everywhere else without any extra plumbing.
+    let camera: SceneCamera = initialProjectionRef.current === "perspective" ? makePerspectiveCamera() : makeOrthoCamera();
     cameraRef.current = camera;
 
     const renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -247,13 +311,45 @@ export function Viewport() {
     scene.add(grid);
 
     const target = new THREE.Vector3(0, 0, 0);
-    const orbit = new OrbitControls(camera, renderer.domElement);
-    orbit.target.copy(target);
-    orbit.enableDamping = true;
-    orbit.dampingFactor = 0.08;
+    function makeOrbit(cam: SceneCamera): OrbitControls {
+      const controls = new OrbitControls(cam, renderer.domElement);
+      controls.target.copy(target);
+      controls.enableDamping = true;
+      controls.dampingFactor = 0.08;
+      return controls;
+    }
+    let orbit = makeOrbit(camera);
     orbitRef.current = orbit;
-    applyViewPreset(camera, target, "iso", 300);
+    applyViewPreset(camera, target, "iso", fitDistance(camera, viewSizeRef.current));
     orbit.update();
+
+    function switchCamera(kind: CameraProjection) {
+      const isPerspective = camera instanceof THREE.PerspectiveCamera;
+      if ((kind === "perspective") === isPerspective) return;
+      const oldPos = camera.position.clone();
+      const oldUp = camera.up.clone();
+      const distance = oldPos.distanceTo(orbit.target) || 300;
+
+      const next = kind === "perspective" ? makePerspectiveCamera() : makeOrthoCamera();
+      next.up.copy(oldUp);
+      // Preserve the current view direction, re-deriving distance so the framed
+      // content stays about the same apparent size across the switch.
+      const dir = oldPos.clone().sub(orbit.target).normalize();
+      next.position.copy(orbit.target).add(dir.multiplyScalar(fitDistance(next, viewSizeRef.current) || distance));
+      next.lookAt(orbit.target);
+
+      const w = containerRef.current?.clientWidth || width;
+      const h = containerRef.current?.clientHeight || height;
+      fitCameraFrustum(next, viewSizeRef.current, w / h);
+
+      orbit.dispose();
+      camera = next;
+      orbit = makeOrbit(camera);
+      orbit.update();
+      cameraRef.current = camera;
+      orbitRef.current = orbit;
+    }
+    switchCameraRef.current = switchCamera;
 
     const raycaster = new THREE.Raycaster();
     const dom = renderer.domElement;
@@ -267,8 +363,15 @@ export function Viewport() {
         -((clientY - rect.top) / rect.height) * 2 + 1,
       );
       raycaster.setFromCamera(ndc, camera);
-      const frustumWidth = (camera.right - camera.left) / camera.zoom;
-      raycaster.params.Line = { threshold: (frustumWidth / rect.width) * 6 };
+      // World units per screen pixel, at whatever depth is actually relevant — for
+      // orthographic that's constant everywhere (frustum width / pixel width); for
+      // perspective it grows with distance, so approximate it at the orbit target's
+      // depth (where the assembly usually sits).
+      const worldPerPixel =
+        camera instanceof THREE.OrthographicCamera
+          ? (camera.right - camera.left) / camera.zoom / rect.width
+          : (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) * camera.position.distanceTo(orbit.target)) / rect.height;
+      raycaster.params.Line = { threshold: worldPerPixel * 6 };
       return raycaster;
     }
 
@@ -284,7 +387,8 @@ export function Viewport() {
         const hit = lineHits[0];
         const partId = hit.object.userData.partId as string;
         const segmentIndex = Math.floor((hit.index ?? 0) / 2);
-        const edge = currentParts.get(partId)?.part.mesh.edges[segmentIndex];
+        const edgeIdx = visualsRef.current.get(partId)?.edgeSegmentIndex[segmentIndex];
+        const edge = edgeIdx !== undefined ? currentParts.get(partId)?.part.mesh.edges[edgeIdx] : undefined;
         if (edge) {
           pickEntity({ partId, kind: "edge", id: edge.id });
           return;
@@ -309,7 +413,36 @@ export function Viewport() {
       latestPointerRef.current = { x: e.clientX, y: e.clientY };
       armedDragRef.current = null;
 
-      const { selectedPartId: selId, parts: currentParts, transformMode, rotatePivotMode } = useAssemblyStore.getState();
+      const { selectedPartId: selId, selectedGroupId: selGroupId, parts: currentParts, transformMode, rotatePivotMode } = useAssemblyStore.getState();
+
+      if (selGroupId && transformMode === "translate") {
+        const memberIds = Array.from(currentParts.entries())
+          .filter(([, st]) => st.groupId === selGroupId && !st.fixed)
+          .map(([id]) => id);
+        const rc = raycasterFromEvent(e.clientX, e.clientY);
+        const hitMemberId = rc && memberIds.find((id) => {
+          const v = visualsRef.current.get(id);
+          return v && rc.intersectObject(v.mesh, false).length > 0;
+        });
+        if (rc && hitMemberId) {
+          const hitVisual = visualsRef.current.get(hitMemberId)!;
+          const viewDir = new THREE.Vector3();
+          camera.getWorldDirection(viewDir);
+          const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(viewDir, hitVisual.group.position);
+          const startPoint = new THREE.Vector3();
+          if (rc.ray.intersectPlane(plane, startPoint)) {
+            const startPositions = new Map<string, THREE.Vector3>();
+            for (const id of memberIds) {
+              const v = visualsRef.current.get(id);
+              if (v) startPositions.set(id, v.group.position.clone());
+            }
+            orbit.enabled = false;
+            armedDragRef.current = { kind: "translateGroup", groupId: selGroupId, dragging: false, plane, startPoint, startPositions };
+          }
+          return;
+        }
+      }
+
       if (!selId) return;
       const state = currentParts.get(selId);
       const visual = visualsRef.current.get(selId);
@@ -353,15 +486,24 @@ export function Viewport() {
       latestPointerRef.current = { x: e.clientX, y: e.clientY };
       const armed = armedDragRef.current;
       if (!armed) {
-        // Cursor affordance: "grab" over the draggable selected part, default elsewhere.
-        const selId = useAssemblyStore.getState().selectedPartId;
-        const visual = selId ? visualsRef.current.get(selId) : undefined;
-        if (visual) {
+        // Cursor affordance: "grab" over the draggable selected part (or any member of the
+        // selected group, when in translate mode), default elsewhere.
+        const { selectedPartId: selId, selectedGroupId: selGroupId, parts: currentParts, transformMode: mode } = useAssemblyStore.getState();
+        let hovering = false;
+        if (selGroupId && mode === "translate") {
           const rc = raycasterFromEvent(e.clientX, e.clientY);
-          dom.style.cursor = rc && rc.intersectObject(visual.mesh, false).length > 0 ? "grab" : "";
-        } else {
-          dom.style.cursor = "";
+          hovering = !!rc && Array.from(currentParts.entries()).some(
+            ([id, st]) => st.groupId === selGroupId && !st.fixed && (visualsRef.current.get(id)?.mesh ? rc.intersectObject(visualsRef.current.get(id)!.mesh, false).length > 0 : false),
+          );
         }
+        if (!hovering && selId) {
+          const visual = visualsRef.current.get(selId);
+          if (visual) {
+            const rc = raycasterFromEvent(e.clientX, e.clientY);
+            hovering = !!rc && rc.intersectObject(visual.mesh, false).length > 0;
+          }
+        }
+        dom.style.cursor = hovering ? "grab" : "";
         return;
       }
 
@@ -384,10 +526,25 @@ export function Viewport() {
       if (!armed || !armed.dragging || !pointer) return;
 
       const store = useAssemblyStore.getState();
-      const currentState = store.parts.get(armed.partId);
-      if (!currentState) return;
       const rect = containerRef.current?.getBoundingClientRect();
       if (!rect) return;
+
+      if (armed.kind === "translateGroup") {
+        const rc = raycasterFromEvent(pointer.x, pointer.y);
+        if (!rc) return;
+        const hit = new THREE.Vector3();
+        if (!rc.ray.intersectPlane(armed.plane, hit)) return;
+        const delta = hit.sub(armed.startPoint);
+        const patches = Array.from(armed.startPositions.entries()).map(([partId, startPosition]) => {
+          const target = startPosition.clone().add(delta);
+          return { partId, position: [target.x, target.y, target.z] as [number, number, number] };
+        });
+        store.applyGroupDragPreview(patches);
+        return;
+      }
+
+      const currentState = store.parts.get(armed.partId);
+      if (!currentState) return;
       const curPos = new THREE.Vector3(...currentState.pose.position);
       const curQuat = new THREE.Quaternion(...currentState.pose.quaternion);
 
@@ -473,14 +630,26 @@ export function Viewport() {
       lastFrameTime = now;
 
       if (heldKeys.size > 0) {
-        const offset = camera.position.clone().sub(orbit.target);
+        // THREE.Spherical's pole is the Y axis — fine for a default Y-up scene, but
+        // this one is Z-up (see viewPresets.ts), so its phi/theta don't correspond to
+        // "tilt"/"swing" here at all: rotating theta actually orbits around whatever
+        // arbitrary horizontal direction Y happens to be, tracing a cone around it
+        // (never showing the opposite side) rather than turning like a turntable
+        // around the vertical axis, and it can go nearly inert at some view angles
+        // (Frontal view puts the camera offset almost exactly on Spherical's own pole,
+        // a gimbal-like singularity where changing theta barely moves anything).
+        // OrbitControls sidesteps this by rotating into a frame where camera.up maps
+        // to +Y before doing the spherical math, and back out after — do the same here.
+        const upAlign = new THREE.Quaternion().setFromUnitVectors(camera.up, new THREE.Vector3(0, 1, 0));
+        const upAlignInv = upAlign.clone().invert();
+        const offset = camera.position.clone().sub(orbit.target).applyQuaternion(upAlign);
         const spherical = new THREE.Spherical().setFromVector3(offset);
         if (heldKeys.has("a")) spherical.theta += CAMERA_KEY_SPEED * dt;
         if (heldKeys.has("d")) spherical.theta -= CAMERA_KEY_SPEED * dt;
         if (heldKeys.has("w")) spherical.phi -= CAMERA_KEY_SPEED * dt;
         if (heldKeys.has("s")) spherical.phi += CAMERA_KEY_SPEED * dt;
         spherical.phi = THREE.MathUtils.clamp(spherical.phi, 0.01, Math.PI - 0.01);
-        offset.setFromSpherical(spherical);
+        offset.setFromSpherical(spherical).applyQuaternion(upAlignInv);
         camera.position.copy(orbit.target).add(offset);
       }
 
@@ -497,13 +666,7 @@ export function Viewport() {
       const w = el.clientWidth;
       const h = el.clientHeight;
       if (w === 0 || h === 0) return;
-      const a = w / h;
-      const vs = viewSizeRef.current;
-      camera.left = -vs * a;
-      camera.right = vs * a;
-      camera.top = vs;
-      camera.bottom = -vs;
-      camera.updateProjectionMatrix();
+      fitCameraFrustum(camera, viewSizeRef.current, w / h, false);
       renderer.setSize(w, h);
     });
     resizeObserver.observe(container);
@@ -585,6 +748,11 @@ export function Viewport() {
     });
   }, [parts, partOrder, selectedPartId, pickedEntities]);
 
+  // --- camera projection toggle (ortho <-> perspective) ---
+  useEffect(() => {
+    switchCameraRef.current?.(cameraProjection);
+  }, [cameraProjection]);
+
   // --- view preset requests ---
   useEffect(() => {
     if (!requestedView) return;
@@ -611,15 +779,11 @@ export function Viewport() {
       const size = box.getSize(new THREE.Vector3());
       const radius = Math.max(size.x, size.y, size.z, 10) * 0.75;
       viewSizeRef.current = radius;
-      const aspect = (camera.right - camera.left) / (camera.top - camera.bottom);
-      camera.top = radius;
-      camera.bottom = -radius;
-      camera.left = -radius * aspect;
-      camera.right = radius * aspect;
-      camera.zoom = 1;
-      camera.updateProjectionMatrix();
+      const el = containerRef.current;
+      const aspect = el && el.clientHeight > 0 ? el.clientWidth / el.clientHeight : 1;
+      fitCameraFrustum(camera, radius, aspect);
       orbit.target.copy(center);
-      applyViewPreset(camera, center, "iso", radius * 3);
+      applyViewPreset(camera, center, "iso", fitDistance(camera, radius));
       orbit.update();
     });
     return () => cancelAnimationFrame(raf);

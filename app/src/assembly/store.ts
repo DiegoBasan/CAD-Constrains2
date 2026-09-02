@@ -14,9 +14,23 @@ export interface PartState {
    * together (common for STEP files that don't use proper assembly structure) —
    * enables the "Separar" action in the tree panel. */
   canSplit: boolean;
+  /** Which Group (if any) this part belongs to — a part in a group is still a fully
+   * independent object (its own pose, fixed state, relations); grouping only adds a
+   * convenience: selecting the group and dragging any member moves every member by
+   * the same rigid delta together. */
+  groupId?: string;
+}
+
+/** A folder of parts that move together in the viewport (see PartState.groupId) —
+ * purely an organizational/movement convenience, not a rigid assembly: each member
+ * keeps its own relations and can still be selected and moved individually. */
+export interface Group {
+  id: string;
+  name: string;
 }
 
 export type ViewPreset = "iso" | "front" | "top" | "right";
+export type CameraProjection = "ortho" | "perspective";
 export type TransformMode = "translate" | "rotate";
 /** Which pivot a rotate-drag turns the selected part around: "part" spins it in place
  * about its own origin, "camera" orbits it (position and orientation both) about the
@@ -30,6 +44,7 @@ interface HistorySnapshot {
   parts: Map<string, PartState>;
   partOrder: string[];
   relations: Relation[];
+  groups: Group[];
 }
 
 const MAX_HISTORY = 50;
@@ -54,12 +69,17 @@ interface AssemblyStore {
   parts: Map<string, PartState>;
   partOrder: string[];
   relations: Relation[];
+  groups: Group[];
   history: HistorySnapshot[];
   future: HistorySnapshot[];
   keyframes: Keyframe[];
   isPlaying: boolean;
 
   selectedPartId: string | null;
+  /** A selected group behaves like a selected part for viewport dragging (translate
+   * only — see Viewport.tsx) — every member moves by the same delta, but stays fully
+   * independent otherwise. Mutually exclusive with selectedPartId. */
+  selectedGroupId: string | null;
   pickedEntities: EntityRef[];
   /** When set, the next entity pick replaces that side of the given relation
    * instead of feeding the normal two-pick "new relation" flow. */
@@ -67,6 +87,7 @@ interface AssemblyStore {
   transformMode: TransformMode;
   rotatePivotMode: RotatePivotMode;
   requestedView: ViewPreset | null;
+  cameraProjection: CameraProjection;
 
   isSolving: boolean;
   lastSolve: { residualNorm: number; converged: boolean } | null;
@@ -78,6 +99,16 @@ interface AssemblyStore {
   pickEntity: (ref: EntityRef) => void;
   clearPicked: () => void;
 
+  createGroup: (partIds: string[], name?: string) => void;
+  ungroupParts: (groupId: string) => void;
+  renameGroup: (groupId: string, name: string) => void;
+  selectGroup: (groupId: string | null) => void;
+  /** Real-time preview during a group drag: same mechanism as applyDragPreview, but
+   * seeds several parts' poses at once (each member offset by the same rigid delta),
+   * so the whole group tracks the cursor together while each member still resists
+   * independently wherever its own relations constrain it. */
+  applyGroupDragPreview: (patches: { partId: string; position?: Vec3; quaternion?: Quat }[]) => void;
+
   setPose: (partId: string, pose: Pose) => void;
   toggleFixed: (partId: string) => void;
   toggleVisible: (partId: string) => void;
@@ -85,6 +116,7 @@ interface AssemblyStore {
   setRotatePivotMode: (mode: RotatePivotMode) => void;
   requestView: (view: ViewPreset) => void;
   consumeRequestedView: () => void;
+  setCameraProjection: (projection: CameraProjection) => void;
 
   addRelation: (type: RelationType, value: number) => void;
   removeRelation: (id: string) => void;
@@ -133,6 +165,7 @@ interface AssemblyStore {
 let relationCounter = 0;
 let importCounter = 0;
 let keyframeCounter = 0;
+let groupCounter = 0;
 let playbackToken = 0;
 
 /** Shared by the live-drag preview and keyframe playback: re-solve the assembly's
@@ -168,17 +201,20 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
   parts: new Map(),
   partOrder: [],
   relations: [],
+  groups: [],
   history: [],
   future: [],
   keyframes: [],
   isPlaying: false,
 
   selectedPartId: null,
+  selectedGroupId: null,
   pickedEntities: [],
   editingRelationSide: null,
   transformMode: "translate",
   rotatePivotMode: "part",
   requestedView: "iso",
+  cameraProjection: "ortho",
 
   isSolving: false,
   lastSolve: null,
@@ -217,14 +253,71 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
       parts: new Map(),
       partOrder: [],
       relations: [],
+      groups: [],
       keyframes: [],
       selectedPartId: null,
+      selectedGroupId: null,
       pickedEntities: [],
       lastSolve: null,
     });
   },
 
-  selectPart: (partId) => set({ selectedPartId: partId, pickedEntities: [] }),
+  selectPart: (partId) => set({ selectedPartId: partId, selectedGroupId: null, pickedEntities: [] }),
+
+  createGroup: (partIds, name) => {
+    const ids = partIds.filter((id) => get().parts.has(id));
+    if (ids.length < 2) return;
+    get().pushHistorySnapshot();
+    const groupId = `grp-${groupCounter++}`;
+    const parts = new Map(get().parts);
+    for (const id of ids) {
+      const entry = parts.get(id);
+      if (entry) parts.set(id, { ...entry, groupId });
+    }
+    set({
+      parts,
+      groups: [...get().groups, { id: groupId, name: name?.trim() || `Grupo ${get().groups.length + 1}` }],
+      selectedPartId: null,
+      selectedGroupId: groupId,
+      pickedEntities: [],
+    });
+  },
+
+  ungroupParts: (groupId) => {
+    get().pushHistorySnapshot();
+    const parts = new Map(get().parts);
+    for (const [id, entry] of parts) {
+      if (entry.groupId === groupId) parts.set(id, { ...entry, groupId: undefined });
+    }
+    set({
+      parts,
+      groups: get().groups.filter((g) => g.id !== groupId),
+      selectedGroupId: get().selectedGroupId === groupId ? null : get().selectedGroupId,
+    });
+  },
+
+  renameGroup: (groupId, name) => {
+    set({ groups: get().groups.map((g) => (g.id === groupId ? { ...g, name: name.trim() || g.name } : g)) });
+  },
+
+  selectGroup: (groupId) => set({ selectedGroupId: groupId, selectedPartId: null, pickedEntities: [] }),
+
+  applyGroupDragPreview: (patches) => {
+    const { parts, relations } = get();
+    const seed = new Map<string, Pose>();
+    for (const { partId, position, quaternion } of patches) {
+      const entry = parts.get(partId);
+      if (!entry) continue;
+      seed.set(partId, { position: position ?? entry.pose.position, quaternion: quaternion ?? entry.pose.quaternion });
+    }
+    const result = solveFromSeed(parts, relations, seed);
+    const nextParts = new Map(parts);
+    for (const [id, pose] of result.poses) {
+      const e = nextParts.get(id);
+      if (e) nextParts.set(id, { ...e, pose });
+    }
+    set({ parts: nextParts });
+  },
 
   pickEntity: (ref) => {
     const editing = get().editingRelationSide;
@@ -280,6 +373,7 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
   setRotatePivotMode: (mode) => set({ rotatePivotMode: mode }),
   requestView: (view) => set({ requestedView: view }),
   consumeRequestedView: () => set({ requestedView: null }),
+  setCameraProjection: (projection) => set({ cameraProjection: projection }),
 
   addRelation: (type, value) => {
     const [a, b] = get().pickedEntities;
@@ -339,6 +433,7 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
         fixed: state.fixed,
         visible: true,
         canSplit: false,
+        groupId: state.groupId,
       });
       newIds.push(id);
     });
@@ -553,38 +648,42 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
   },
 
   pushHistorySnapshot: () => {
-    const { parts, partOrder, relations, history } = get();
+    const { parts, partOrder, relations, groups, history } = get();
     const trimmed = history.length >= MAX_HISTORY ? history.slice(history.length - MAX_HISTORY + 1) : history;
-    set({ history: [...trimmed, { parts, partOrder, relations }], future: [] });
+    set({ history: [...trimmed, { parts, partOrder, relations, groups }], future: [] });
   },
 
   undo: () => {
-    const { history, future, parts, partOrder, relations } = get();
+    const { history, future, parts, partOrder, relations, groups } = get();
     const previous = history[history.length - 1];
     if (!previous) return;
     set({
       parts: previous.parts,
       partOrder: previous.partOrder,
       relations: previous.relations,
+      groups: previous.groups,
       history: history.slice(0, -1),
-      future: [...future, { parts, partOrder, relations }],
+      future: [...future, { parts, partOrder, relations, groups }],
       selectedPartId: null,
+      selectedGroupId: null,
       pickedEntities: [],
       editingRelationSide: null,
     });
   },
 
   redo: () => {
-    const { history, future, parts, partOrder, relations } = get();
+    const { history, future, parts, partOrder, relations, groups } = get();
     const next = future[future.length - 1];
     if (!next) return;
     set({
       parts: next.parts,
       partOrder: next.partOrder,
       relations: next.relations,
+      groups: next.groups,
       future: future.slice(0, -1),
-      history: [...history, { parts, partOrder, relations }],
+      history: [...history, { parts, partOrder, relations, groups }],
       selectedPartId: null,
+      selectedGroupId: null,
       pickedEntities: [],
       editingRelationSide: null,
     });
