@@ -36,6 +36,21 @@ export const RELATION_LABELS: Record<RelationType, string> = {
   rigid: "Vincular (rígida)",
 };
 
+/** One glyph per relation type, for quick visual scanning in the relation-type picker
+ * and the relations list — chosen to echo the constraint's geometry rather than being
+ * arbitrary: concentric's bullseye is literally concentric circles, parallel is the
+ * math symbol for it, distance is a between-two-points arrow, planar's triple bar reads
+ * as flush stacked faces, and rigid's link/coincident's target follow the app's existing
+ * emoji-icon style (🔒/📷/✂/👁 elsewhere in the UI). */
+export const RELATION_ICONS: Record<RelationType, string> = {
+  coincident: "🎯",
+  concentric: "◎",
+  planar: "≣",
+  distance: "↔",
+  parallel: "∥",
+  rigid: "🔗",
+};
+
 export interface ResolvedEntity {
   /** A representative point (axis origin for cylindrical, centroid-ish point for planar, midpoint/center for edges). */
   point: THREE.Vector3;

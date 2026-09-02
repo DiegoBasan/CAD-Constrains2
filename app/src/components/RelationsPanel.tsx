@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useAssemblyStore } from "../assembly/store";
-import { RELATION_LABELS, type Relation, type RelationType } from "../assembly/relations";
+import { RELATION_ICONS, RELATION_LABELS, type Relation, type RelationType } from "../assembly/relations";
 import type { EntityRef } from "../occ/types";
 
 const NEEDS_VALUE: Partial<Record<RelationType, boolean>> = { distance: true, planar: true };
@@ -152,9 +152,10 @@ export function RelationsPanel() {
                 <button
                   key={type}
                   onClick={() => addRelation(type, value)}
-                  className="rounded-md border px-2 py-1 text-[11px] font-medium"
+                  className="flex items-center gap-1 rounded-md border px-2 py-1 text-[11px] font-medium"
                   style={{ borderColor: "var(--accent-dim)", color: "var(--accent)", background: "var(--accent-bg)" }}
                 >
+                  <span aria-hidden="true">{RELATION_ICONS[type]}</span>
                   {RELATION_LABELS[type]}
                 </button>
               ))}
@@ -189,7 +190,8 @@ export function RelationsPanel() {
         {relations.map((rel) => (
           <div key={rel.id} className="flex flex-col gap-1 border-b px-3 py-2 text-[11px]" style={{ borderColor: "var(--border)" }}>
             <div className="flex items-center justify-between">
-              <span className="font-medium" style={{ color: "var(--text-bright)" }}>
+              <span className="flex items-center gap-1 font-medium" style={{ color: "var(--text-bright)" }}>
+                <span aria-hidden="true">{RELATION_ICONS[rel.type]}</span>
                 {RELATION_LABELS[rel.type]}
               </span>
               <button onClick={() => removeRelation(rel.id)} style={{ color: "var(--danger)" }}>
