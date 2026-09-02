@@ -71,9 +71,12 @@ export interface ImportedAssembly {
   parts: ImportedPart[];
 }
 
-/** What the user has clicked on in the viewport. */
+/** What the user has clicked on in the viewport. "part" refers to the whole object (its
+ * own origin/orientation) rather than one of its faces/edges — used by the "rigid"
+ * relation, which welds two parts' poses together instead of aligning a picked feature;
+ * `id` is unused (0) for that kind. */
 export interface EntityRef {
   partId: string;
-  kind: "face" | "edge";
-  id: number; // FaceInfo.id or EdgeInfo.id
+  kind: "face" | "edge" | "part";
+  id: number; // FaceInfo.id or EdgeInfo.id; unused for kind "part"
 }

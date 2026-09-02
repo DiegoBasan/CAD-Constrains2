@@ -2,47 +2,54 @@ import { useState } from "react";
 import { useAssemblyStore, type PartState } from "../assembly/store";
 import { partColor } from "../scene/colors";
 
+function hexToNumber(hex: string): number {
+  return parseInt(hex.slice(1), 16);
+}
+function numberToHex(color: number): string {
+  return `#${color.toString(16).padStart(6, "0")}`;
+}
+
 export function TreePanel() {
   const partOrder = useAssemblyStore((s) => s.partOrder);
   const parts = useAssemblyStore((s) => s.parts);
   const groups = useAssemblyStore((s) => s.groups);
   const selectedPartId = useAssemblyStore((s) => s.selectedPartId);
   const selectedGroupId = useAssemblyStore((s) => s.selectedGroupId);
+  const selectedPartIds = useAssemblyStore((s) => s.selectedPartIds);
   const selectPart = useAssemblyStore((s) => s.selectPart);
   const selectGroup = useAssemblyStore((s) => s.selectGroup);
+  const toggleMultiSelect = useAssemblyStore((s) => s.toggleMultiSelect);
+  const clearMultiSelect = useAssemblyStore((s) => s.clearMultiSelect);
   const createGroup = useAssemblyStore((s) => s.createGroup);
   const ungroupParts = useAssemblyStore((s) => s.ungroupParts);
   const renameGroup = useAssemblyStore((s) => s.renameGroup);
   const mergeParts = useAssemblyStore((s) => s.mergeParts);
+  const addRigidRelation = useAssemblyStore((s) => s.addRigidRelation);
   const toggleFixed = useAssemblyStore((s) => s.toggleFixed);
   const toggleVisible = useAssemblyStore((s) => s.toggleVisible);
   const splitPart = useAssemblyStore((s) => s.splitPart);
+  const bulkSetFixed = useAssemblyStore((s) => s.bulkSetFixed);
+  const bulkSetColor = useAssemblyStore((s) => s.bulkSetColor);
+  const addCamera = useAssemblyStore((s) => s.addCamera);
 
-  // Multi-select for grouping, kept local — separate from the store's single-selection
-  // (which drives the viewport gizmo/highlight for one part or one group at a time).
-  const [multiSelected, setMultiSelected] = useState<Set<string>>(new Set());
   const [editingGroupId, setEditingGroupId] = useState<string | null>(null);
   const [editingName, setEditingName] = useState("");
 
   function handlePartClick(e: React.MouseEvent, id: string) {
     if (e.ctrlKey || e.metaKey) {
-      setMultiSelected((prev) => {
-        // A plain click only drives store selection, not local multi-select — so the
-        // first Ctrl-click of a gesture needs to seed the set with whatever's already
-        // singly-selected, or a lone Ctrl-click on a second part would never reach 2.
-        const next = new Set(prev.size > 0 ? prev : selectedPartId ? [selectedPartId] : []);
-        if (next.has(id)) next.delete(id);
-        else next.add(id);
-        return next;
-      });
+      // A plain click only drives store selection, not multi-select — so the first
+      // Ctrl-click of a gesture needs to seed the set with whatever's already singly
+      // selected, or a lone Ctrl-click on a second part would never reach 2.
+      if (selectedPartIds.size === 0 && selectedPartId) toggleMultiSelect(selectedPartId);
+      toggleMultiSelect(id);
       return;
     }
-    setMultiSelected(new Set());
+    clearMultiSelect();
     selectPart(selectedPartId === id ? null : id);
   }
 
   function handleGroupHeaderClick(groupId: string) {
-    setMultiSelected(new Set());
+    clearMultiSelect();
     selectGroup(selectedGroupId === groupId ? null : groupId);
   }
 
@@ -57,6 +64,7 @@ export function TreePanel() {
   }
 
   const renderedGroups = new Set<string>();
+  const multiCount = selectedPartIds.size;
 
   return (
     <div className="flex h-full flex-col">
@@ -65,33 +73,75 @@ export function TreePanel() {
         style={{ color: "var(--text-dim)", borderBottom: "1px solid var(--border)" }}
       >
         <span>Piezas</span>
-        {multiSelected.size >= 2 && (
-          <div className="flex items-center gap-1.5">
+        <button
+          onClick={addCamera}
+          title="Agregar un objeto cámara (invisible; se ve como un widget POV flotante)"
+          className="rounded px-2 py-0.5 text-[11px] font-medium normal-case hover:opacity-80"
+          style={{ color: "var(--text-dim)" }}
+        >
+          📷 + Cámara
+        </button>
+      </div>
+
+      {multiCount >= 2 && (
+        <div
+          className="flex flex-col gap-1.5 border-b px-3 py-2"
+          style={{ borderColor: "var(--border)", background: "var(--bg-2)" }}
+        >
+          <div className="flex flex-wrap items-center gap-1.5">
             <button
               onClick={() => {
-                createGroup(Array.from(multiSelected));
-                setMultiSelected(new Set());
+                createGroup(Array.from(selectedPartIds));
+                clearMultiSelect();
               }}
               title="Cada pieza sigue siendo independiente, pero se mueven juntas al arrastrar cualquier miembro"
-              className="rounded px-2 py-0.5 text-[11px] font-medium normal-case hover:opacity-80"
+              className="rounded px-2 py-0.5 text-[11px] font-medium hover:opacity-80"
               style={{ background: "var(--accent-bg)", color: "var(--accent)" }}
             >
-              Agrupar ({multiSelected.size})
+              Agrupar ({multiCount})
             </button>
             <button
               onClick={() => {
-                mergeParts(Array.from(multiSelected));
-                setMultiSelected(new Set());
+                mergeParts(Array.from(selectedPartIds));
+                clearMultiSelect();
               }}
               title="Combina las piezas seleccionadas en una sola (une sus mallas, ya no se pueden mover por separado)"
-              className="rounded px-2 py-0.5 text-[11px] font-medium normal-case hover:opacity-80"
+              className="rounded px-2 py-0.5 text-[11px] font-medium hover:opacity-80"
               style={{ background: "var(--bg-3)", color: "var(--text-bright)", border: "1px solid var(--border-strong)" }}
             >
-              Unir ({multiSelected.size})
+              Unir ({multiCount})
+            </button>
+            <button
+              onClick={() => addRigidRelation(Array.from(selectedPartIds))}
+              title="Relación rígida: donde sea que estén ahora quedan vinculadas — mover cualquiera mueve a todas igual en posición y rotación"
+              className="rounded px-2 py-0.5 text-[11px] font-medium hover:opacity-80"
+              style={{ background: "var(--bg-3)", color: "var(--text-bright)", border: "1px solid var(--border-strong)" }}
+            >
+              Vincular ({multiCount})
             </button>
           </div>
-        )}
-      </div>
+          <div className="flex items-center gap-3 text-[11px]" style={{ color: "var(--text-dim)" }}>
+            <button onClick={() => bulkSetFixed(Array.from(selectedPartIds), true)} className="hover:opacity-80">
+              🔒 Fijar
+            </button>
+            <button onClick={() => bulkSetFixed(Array.from(selectedPartIds), false)} className="hover:opacity-80">
+              🔓 Liberar
+            </button>
+            <label className="flex items-center gap-1.5">
+              Color
+              <input
+                type="color"
+                onChange={(e) => bulkSetColor(Array.from(selectedPartIds), hexToNumber(e.target.value))}
+                className="h-4 w-6 cursor-pointer rounded border-0 bg-transparent p-0"
+              />
+            </label>
+            <button onClick={clearMultiSelect} className="ml-auto underline hover:opacity-80">
+              Limpiar
+            </button>
+          </div>
+        </div>
+      )}
+
       <div className="flex-1 overflow-y-auto">
         {partOrder.length === 0 && (
           <div className="px-3 py-6 text-center text-[12px]" style={{ color: "var(--text-dim)" }}>
@@ -169,7 +219,7 @@ export function TreePanel() {
                       index={memberIndex}
                       state={memberState}
                       selected={memberId === selectedPartId}
-                      multiSelected={multiSelected.has(memberId)}
+                      multiSelected={selectedPartIds.has(memberId)}
                       indent
                       onClick={handlePartClick}
                       onToggleFixed={toggleFixed}
@@ -189,7 +239,7 @@ export function TreePanel() {
               index={index}
               state={state}
               selected={id === selectedPartId}
-              multiSelected={multiSelected.has(id)}
+              multiSelected={selectedPartIds.has(id)}
               onClick={handlePartClick}
               onToggleFixed={toggleFixed}
               onToggleVisible={toggleVisible}
@@ -226,7 +276,7 @@ function PartRow({
   onSplit: (id: string) => void;
 }) {
   if (!state) return null;
-  const color = `#${partColor(index).toString(16).padStart(6, "0")}`;
+  const color = numberToHex(state.color ?? partColor(index));
   return (
     <div
       onClick={(e) => onClick(e, id)}
@@ -239,7 +289,11 @@ function PartRow({
         outlineOffset: "-1px",
       }}
     >
-      <span className="h-2.5 w-2.5 shrink-0 rounded-sm" style={{ background: color }} />
+      {state.isCamera ? (
+        <span className="shrink-0 text-[12px]">📷</span>
+      ) : (
+        <span className="h-2.5 w-2.5 shrink-0 rounded-sm" style={{ background: color }} />
+      )}
       <span className="flex-1 truncate">{state.part.name}</span>
       {state.canSplit && (
         <button

@@ -1,6 +1,6 @@
 import * as THREE from "three";
 import { create } from "zustand";
-import type { EntityRef, ImportedAssembly, ImportedPart, Pose, Quat, Vec3 } from "../occ/types";
+import type { EntityRef, FaceInfo, EdgeInfo, ImportedAssembly, ImportedPart, Pose, Quat, Vec3 } from "../occ/types";
 import { countConnectedBodies, splitPartMesh } from "../occ/split";
 import { applicableRelationTypes, resolveEntity, type Relation, type RelationType } from "./relations";
 import { solveAssembly } from "./solver";
@@ -31,6 +31,17 @@ export interface PartState {
   /** Per-axis [min, max] clamp (mm for x/y/z, degrees for rx/ry/rz), enforced the same
    * way as `axisLock`. */
   axisLimits?: Partial<Record<AxisKey, [number, number]>>;
+  /** Overrides the palette color normally derived from this part's position in
+   * `partOrder` — set via the tree panel's color picker (single or bulk). */
+  color?: number;
+  /** True for a virtual camera object rather than an imported physical part — reuses
+   * every part mechanism (pose, drag, relations, groups) for free, since a camera is
+   * just a part with an empty mesh (nothing to tessellate/render as a solid) plus a
+   * field of view. Rendered as a wireframe frustum gizmo instead of a mesh; see
+   * `cameraFov` and the "camera POV widget" in Viewport.tsx. */
+  isCamera?: boolean;
+  /** Only for `isCamera` parts: field of view in degrees. */
+  cameraFov?: number;
 }
 
 /** A folder of parts that move together in the viewport (see PartState.groupId) —
@@ -93,6 +104,12 @@ interface AssemblyStore {
    * only — see Viewport.tsx) — every member moves by the same delta, but stays fully
    * independent otherwise. Mutually exclusive with selectedPartId. */
   selectedGroupId: string | null;
+  /** Ad-hoc multi-selection (Ctrl/Cmd-click in the tree, Shift-click in the viewport) —
+   * independent of `selectedPartId`/`selectedGroupId`, which still drive the single-part
+   * gizmo/inspector. Dragging any member (with 2+ selected) moves the whole selection
+   * together the same way a Group does, without needing to actually create one; the
+   * bulk action bar (color/group/fix/vincular) also reads from this set. */
+  selectedPartIds: Set<string>;
   pickedEntities: EntityRef[];
   /** When set, the next entity pick replaces that side of the given relation
    * instead of feeding the normal two-pick "new relation" flow. */
@@ -108,6 +125,7 @@ interface AssemblyStore {
    * slider reads as "how much perspective distortion", not "zoom". */
   perspectiveFov: number;
   colorMode: ColorMode;
+  loopPlayback: boolean;
 
   isSolving: boolean;
   lastSolve: { residualNorm: number; converged: boolean } | null;
@@ -118,6 +136,23 @@ interface AssemblyStore {
   selectPart: (partId: string | null) => void;
   pickEntity: (ref: EntityRef) => void;
   clearPicked: () => void;
+
+  /** Adds/removes one part from the ad-hoc multi-selection, independent of
+   * selectedPartId/selectedGroupId. Used by both Ctrl/Cmd-click in the tree and
+   * Shift-click in the viewport. */
+  toggleMultiSelect: (partId: string) => void;
+  clearMultiSelect: () => void;
+  /** Bulk actions over the current multi-selection (or an explicit id list). */
+  bulkSetFixed: (partIds: string[], fixed: boolean) => void;
+  bulkSetColor: (partIds: string[], color: number) => void;
+  setPartColor: (partId: string, color: number | undefined) => void;
+  /** Welds every other selected part to the first one with a "rigid" relation (its
+   * current relative offset captured as the constraint) — moving any of them from then
+   * on moves all of them together, translation and rotation alike. Needs >=2 ids. */
+  addRigidRelation: (partIds: string[]) => void;
+
+  addCamera: () => void;
+  setCameraFov: (partId: string, fov: number) => void;
 
   createGroup: (partIds: string[], name?: string) => void;
   ungroupParts: (groupId: string) => void;
@@ -192,14 +227,23 @@ interface AssemblyStore {
   overwriteKeyframe: (id: string) => void;
   playKeyframes: () => void;
   stopPlayback: () => void;
+  setLoopPlayback: (loop: boolean) => void;
 
   applicableRelationTypesForPicked: () => RelationType[];
+
+  /** Serializes the whole project (parts/meshes, relations, groups, keyframes) to a
+   * JSON string, for download — see ProjectPanel.tsx. */
+  exportProject: () => string;
+  /** Replaces the current assembly with one parsed from `exportProject`'s output.
+   * Throws if the JSON doesn't look like a project file. */
+  importProject: (json: string) => void;
 }
 
 let relationCounter = 0;
 let importCounter = 0;
 let keyframeCounter = 0;
 let groupCounter = 0;
+let cameraCounter = 0;
 let playbackToken = 0;
 
 /** Shared by the live-drag preview and keyframe playback: re-solve the assembly's
@@ -208,6 +252,58 @@ let playbackToken = 0;
  * Fixed parts always keep their real current pose regardless of `seed` — solveAssembly
  * passes every part's starting pose straight through as its output unless it's free,
  * so seeding a fixed part's pose would otherwise silently relocate it. */
+/** Predicts the other side of a "rigid" relation's pose from one side's known pose,
+ * using the same forward relationship the residual in relations.ts enforces
+ * (B = A translated/rotated by rigidOffset). Used to seed a rigidly-linked partner with
+ * its exact target *before* solving, rather than letting the solver discover it — see
+ * `propagateRigidSeed`. */
+function predictRigidPartner(relation: Relation, knownSide: "a" | "b", knownPose: Pose): Pose {
+  const offset = relation.rigidOffset!;
+  const offsetPos = new THREE.Vector3(...offset.position);
+  const offsetQuat = new THREE.Quaternion(...offset.quaternion);
+  const knownPos = new THREE.Vector3(...knownPose.position);
+  const knownQuat = new THREE.Quaternion(...knownPose.quaternion);
+
+  if (knownSide === "a") {
+    const pos = offsetPos.clone().applyQuaternion(knownQuat).add(knownPos);
+    const quat = knownQuat.clone().multiply(offsetQuat);
+    return { position: [pos.x, pos.y, pos.z], quaternion: [quat.x, quat.y, quat.z, quat.w] };
+  }
+  const aQuat = knownQuat.clone().multiply(offsetQuat.clone().invert());
+  const aPos = knownPos.clone().sub(offsetPos.applyQuaternion(aQuat));
+  return { position: [aPos.x, aPos.y, aPos.z], quaternion: [aQuat.x, aQuat.y, aQuat.z, aQuat.w] };
+}
+
+/** Seeds every part transitively welded to `startId` via "rigid" relations with its
+ * exact predicted pose, starting from `startId`'s own (already-decided) seed pose —
+ * without this, dragging one side of a rigid link with *both* sides free leaves the
+ * solver to split the correction between them however its regularization happens to
+ * prefer (each free part's regularization pulls it toward staying put, and neither one
+ * is privileged as "the one that was actually dragged"), instead of the linked part
+ * following exactly. Mirrors how a Group/multi-select drag already seeds every member
+ * explicitly for the same reason. Skips (but doesn't stop propagation past) a fixed
+ * partner, since a fixed part's pose is never up for negotiation. */
+function propagateRigidSeed(parts: Map<string, PartState>, relations: Relation[], startId: string, startPose: Pose, seed: Map<string, Pose>) {
+  seed.set(startId, startPose);
+  const queue: [string, Pose][] = [[startId, startPose]];
+  while (queue.length > 0) {
+    const [id, pose] = queue.shift()!;
+    for (const rel of relations) {
+      if (rel.type !== "rigid") continue;
+      const isA = rel.a.partId === id;
+      const isB = rel.b.partId === id;
+      if (!isA && !isB) continue;
+      const otherId = isA ? rel.b.partId : rel.a.partId;
+      if (seed.has(otherId)) continue;
+      const otherEntry = parts.get(otherId);
+      if (!otherEntry || otherEntry.fixed) continue;
+      const predicted = predictRigidPartner(rel, isA ? "a" : "b", pose);
+      seed.set(otherId, predicted);
+      queue.push([otherId, predicted]);
+    }
+  }
+}
+
 function solveFromSeed(parts: Map<string, PartState>, relations: Relation[], seed: Map<string, Pose>) {
   const partMap = new Map<string, ImportedPart>();
   const poses = new Map<string, Pose>();
@@ -269,6 +365,89 @@ function clampToAxisConstraints(entry: PartState, patch: { position?: Vec3; quat
   return { position, quaternion };
 }
 
+// --- project export/import -------------------------------------------------------
+// Typed arrays (PartMesh's positions/normals/indices/triangleFaceId) don't round-trip
+// through JSON.stringify/parse as arrays (they'd serialize as {"0":1,"1":2,...} objects
+// and need explicit reconstruction), so the on-disk shape converts them to plain
+// number[] and back explicitly rather than relying on default (de)serialization.
+
+const PROJECT_FILE_VERSION = 1;
+
+interface SerializedMesh {
+  positions: number[];
+  normals: number[];
+  indices: number[];
+  triangleFaceId: number[];
+  faces: FaceInfo[];
+  edges: EdgeInfo[];
+}
+
+interface SerializedPartState extends Omit<PartState, "part"> {
+  part: { id: string; name: string; initialPose: Pose; mesh: SerializedMesh };
+}
+
+interface ProjectFile {
+  version: number;
+  fileNames: string[];
+  partOrder: string[];
+  parts: [string, SerializedPartState][];
+  relations: Relation[];
+  groups: Group[];
+  keyframes: { id: string; name: string; poses: [string, Pose][] }[];
+}
+
+function serializePartState(st: PartState): SerializedPartState {
+  const mesh = st.part.mesh;
+  return {
+    ...st,
+    part: {
+      id: st.part.id,
+      name: st.part.name,
+      initialPose: st.part.initialPose,
+      mesh: {
+        positions: Array.from(mesh.positions),
+        normals: Array.from(mesh.normals),
+        indices: Array.from(mesh.indices),
+        triangleFaceId: Array.from(mesh.triangleFaceId),
+        faces: mesh.faces,
+        edges: mesh.edges,
+      },
+    },
+  };
+}
+
+function deserializePartState(st: SerializedPartState): PartState {
+  const mesh = st.part.mesh;
+  return {
+    ...st,
+    part: {
+      id: st.part.id,
+      name: st.part.name,
+      initialPose: st.part.initialPose,
+      mesh: {
+        positions: Float32Array.from(mesh.positions),
+        normals: Float32Array.from(mesh.normals),
+        indices: Uint32Array.from(mesh.indices),
+        triangleFaceId: Int32Array.from(mesh.triangleFaceId),
+        faces: mesh.faces,
+        edges: mesh.edges,
+      },
+    },
+  };
+}
+
+/** Scans a batch of ids for the highest `N` matched by `pattern` (e.g. /^rel-(\d+)$/)
+ * and returns max(current, N+1) — used after importing a project so any counter used
+ * to mint new ids picks up after whatever the imported file already contains. */
+function bumpCounter(ids: string[], pattern: RegExp, current: number): number {
+  let max = current;
+  for (const id of ids) {
+    const m = pattern.exec(id);
+    if (m) max = Math.max(max, Number(m[1]) + 1);
+  }
+  return max;
+}
+
 function lerpPose(a: Pose, b: Pose, t: number): Pose {
   const position = new THREE.Vector3(...a.position).lerp(new THREE.Vector3(...b.position), t);
   const quaternion = new THREE.Quaternion(...a.quaternion).slerp(new THREE.Quaternion(...b.quaternion), t);
@@ -292,6 +471,7 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
 
   selectedPartId: null,
   selectedGroupId: null,
+  selectedPartIds: new Set(),
   pickedEntities: [],
   editingRelationSide: null,
   transformMode: "translate",
@@ -300,6 +480,7 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
   cameraProjection: "ortho",
   perspectiveFov: 50,
   colorMode: "palette",
+  loopPlayback: false,
 
   isSolving: false,
   lastSolve: null,
@@ -349,6 +530,138 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
 
   selectPart: (partId) => set({ selectedPartId: partId, selectedGroupId: null, pickedEntities: [] }),
 
+  toggleMultiSelect: (partId) => {
+    const next = new Set(get().selectedPartIds);
+    if (next.has(partId)) next.delete(partId);
+    else next.add(partId);
+    set({ selectedPartIds: next });
+  },
+  clearMultiSelect: () => set({ selectedPartIds: new Set() }),
+
+  bulkSetFixed: (partIds, fixed) => {
+    const ids = partIds.filter((id) => get().parts.has(id));
+    if (ids.length === 0) return;
+    get().pushHistorySnapshot();
+    const parts = new Map(get().parts);
+    for (const id of ids) {
+      const entry = parts.get(id);
+      if (entry) parts.set(id, { ...entry, fixed });
+    }
+    set({ parts });
+  },
+
+  bulkSetColor: (partIds, color) => {
+    const ids = partIds.filter((id) => get().parts.has(id));
+    if (ids.length === 0) return;
+    get().pushHistorySnapshot();
+    const parts = new Map(get().parts);
+    for (const id of ids) {
+      const entry = parts.get(id);
+      if (entry) parts.set(id, { ...entry, color });
+    }
+    set({ parts });
+  },
+
+  setPartColor: (partId, color) => {
+    const entry = get().parts.get(partId);
+    if (!entry) return;
+    get().pushHistorySnapshot();
+    const parts = new Map(get().parts);
+    parts.set(partId, { ...entry, color });
+    set({ parts });
+  },
+
+  addRigidRelation: (partIds) => {
+    const ids = partIds.filter((id) => get().parts.has(id));
+    if (ids.length < 2) return;
+    get().pushHistorySnapshot();
+    const parts = get().parts;
+    const anchorId = ids[0];
+    const anchor = parts.get(anchorId)!;
+    const anchorPos = new THREE.Vector3(...anchor.pose.position);
+    const anchorQuat = new THREE.Quaternion(...anchor.pose.quaternion);
+    const anchorQuatInv = anchorQuat.clone().invert();
+
+    const newRelations: Relation[] = [];
+    for (const id of ids.slice(1)) {
+      const entry = parts.get(id)!;
+      const pos = new THREE.Vector3(...entry.pose.position);
+      const quat = new THREE.Quaternion(...entry.pose.quaternion);
+      // B's pose relative to A's, captured now — the offset the "rigid" residual holds
+      // fixed from here on (see relationResiduals in relations.ts).
+      const relPos = pos.clone().sub(anchorPos).applyQuaternion(anchorQuatInv);
+      const relQuat = anchorQuatInv.clone().multiply(quat);
+      newRelations.push({
+        id: `rel-${relationCounter++}`,
+        type: "rigid",
+        a: { partId: anchorId, kind: "part", id: 0 },
+        b: { partId: id, kind: "part", id: 0 },
+        value: 0,
+        rigidOffset: {
+          position: [relPos.x, relPos.y, relPos.z],
+          quaternion: [relQuat.x, relQuat.y, relQuat.z, relQuat.w],
+        },
+      });
+    }
+    set({ relations: [...get().relations, ...newRelations] });
+    get().runSolve();
+  },
+
+  addCamera: () => {
+    get().pushHistorySnapshot();
+    const id = `cam-${cameraCounter++}`;
+
+    // Aim the new camera at wherever the rest of the assembly actually is (a rough
+    // position-only bounding sphere of the non-camera parts, not a real mesh bounds —
+    // just enough to land the camera in view instead of off in an arbitrary void the
+    // user has to go hunt for) — defaulting to a generic ISO-ish offset when the
+    // assembly is empty or is only other cameras.
+    const realParts = Array.from(get().parts.values()).filter((p) => !p.isCamera);
+    const center = new THREE.Vector3();
+    let radius = 80;
+    if (realParts.length > 0) {
+      for (const p of realParts) center.add(new THREE.Vector3(...p.pose.position));
+      center.divideScalar(realParts.length);
+      radius = Math.max(80, ...realParts.map((p) => center.distanceTo(new THREE.Vector3(...p.pose.position)) + 40));
+    }
+    const distance = radius * 1.8;
+    const position = center.clone().add(new THREE.Vector3(-distance * 0.7, -distance * 0.7, distance * 0.5));
+    // Point it at the assembly's center by default — same lookAt-derived quaternion
+    // three.js's own Object3D.lookAt would produce, so the frustum gizmo and POV widget
+    // both start aimed at roughly where the assembly is instead of an arbitrary
+    // identity rotation.
+    const m = new THREE.Matrix4().lookAt(position, center, new THREE.Vector3(0, 0, 1));
+    const quat = new THREE.Quaternion().setFromRotationMatrix(m);
+    const pose: Pose = { position: [position.x, position.y, position.z], quaternion: [quat.x, quat.y, quat.z, quat.w] };
+    const emptyMesh = {
+      positions: new Float32Array(0),
+      normals: new Float32Array(0),
+      indices: new Uint32Array(0),
+      triangleFaceId: new Int32Array(0),
+      faces: [],
+      edges: [],
+    };
+    const parts = new Map(get().parts);
+    parts.set(id, {
+      part: { id, name: `Cámara ${cameraCounter}`, mesh: emptyMesh, initialPose: pose },
+      pose,
+      fixed: false,
+      visible: true,
+      canSplit: false,
+      isCamera: true,
+      cameraFov: 50,
+    });
+    set({ parts, partOrder: [...get().partOrder, id], selectedPartId: id, selectedGroupId: null });
+  },
+
+  setCameraFov: (partId, fov) => {
+    const entry = get().parts.get(partId);
+    if (!entry || !entry.isCamera) return;
+    const parts = new Map(get().parts);
+    parts.set(partId, { ...entry, cameraFov: THREE.MathUtils.clamp(fov, 1, 170) });
+    set({ parts });
+  },
+
   createGroup: (partIds, name) => {
     const ids = partIds.filter((id) => get().parts.has(id));
     if (ids.length < 2) return;
@@ -394,7 +707,10 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
       const entry = parts.get(partId);
       if (!entry) continue;
       const constrained = clampToAxisConstraints(entry, { position, quaternion });
-      seed.set(partId, { position: constrained.position ?? entry.pose.position, quaternion: constrained.quaternion ?? entry.pose.quaternion });
+      const pose: Pose = { position: constrained.position ?? entry.pose.position, quaternion: constrained.quaternion ?? entry.pose.quaternion };
+      // Also seeds anything rigidly welded to this member but outside the dragged
+      // group/multi-selection itself — see propagateRigidSeed.
+      propagateRigidSeed(parts, relations, partId, pose, seed);
     }
     const result = solveFromSeed(parts, relations, seed);
     const nextParts = new Map(parts);
@@ -769,7 +1085,9 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
     if (!entry) return;
     const constrained = clampToAxisConstraints(entry, patch);
     const seedPose: Pose = { position: constrained.position ?? entry.pose.position, quaternion: constrained.quaternion ?? entry.pose.quaternion };
-    const result = solveFromSeed(parts, relations, new Map([[partId, seedPose]]));
+    const seed = new Map<string, Pose>();
+    propagateRigidSeed(parts, relations, partId, seedPose, seed);
+    const result = solveFromSeed(parts, relations, seed);
 
     const nextParts = new Map(parts);
     for (const [id, pose] of result.poses) {
@@ -869,16 +1187,20 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
     }
 
     (async () => {
-      for (let i = 0; i < keyframes.length - 1; i++) {
-        if (token !== playbackToken) break;
-        await runSegment(keyframes[i].poses, keyframes[i + 1].poses);
-      }
+      do {
+        for (let i = 0; i < keyframes.length - 1; i++) {
+          if (token !== playbackToken) break;
+          await runSegment(keyframes[i].poses, keyframes[i + 1].poses);
+        }
+      } while (token === playbackToken && get().loopPlayback);
       if (token === playbackToken) {
         set({ isPlaying: false });
         get().runSolve();
       }
     })();
   },
+
+  setLoopPlayback: (loop) => set({ loopPlayback: loop }),
 
   stopPlayback: () => {
     playbackToken++;
@@ -938,5 +1260,60 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
     const rb = resolveEntity(partB.part, b, partB.pose);
     if (!ra || !rb) return [];
     return applicableRelationTypes(ra, rb);
+  },
+
+  exportProject: () => {
+    const { fileNames, partOrder, parts, relations, groups, keyframes } = get();
+    const file: ProjectFile = {
+      version: PROJECT_FILE_VERSION,
+      fileNames,
+      partOrder,
+      parts: Array.from(parts.entries()).map(([id, st]) => [id, serializePartState(st)]),
+      relations,
+      groups,
+      keyframes: keyframes.map((k) => ({ id: k.id, name: k.name, poses: Array.from(k.poses.entries()) })),
+    };
+    return JSON.stringify(file);
+  },
+
+  importProject: (json) => {
+    let file: ProjectFile;
+    try {
+      file = JSON.parse(json);
+    } catch {
+      throw new Error("El archivo no es JSON válido.");
+    }
+    if (!file || file.version !== PROJECT_FILE_VERSION || !Array.isArray(file.parts)) {
+      throw new Error("No es un archivo de proyecto reconocible.");
+    }
+    get().pushHistorySnapshot();
+
+    const parts = new Map<string, PartState>(file.parts.map(([id, st]) => [id, deserializePartState(st)]));
+    const keyframes: Keyframe[] = file.keyframes.map((k) => ({ id: k.id, name: k.name, poses: new Map(k.poses) }));
+
+    // Bump every id counter past whatever this file contains, so anything created
+    // *after* importing never collides with an id the import just brought in.
+    importCounter = bumpCounter(file.partOrder, /^imp(\d+)-/, importCounter);
+    relationCounter = bumpCounter(file.relations.map((r) => r.id), /^rel-(\d+)$/, relationCounter);
+    groupCounter = bumpCounter(file.groups.map((g) => g.id), /^grp-(\d+)$/, groupCounter);
+    cameraCounter = bumpCounter(Array.from(parts.keys()), /^cam-(\d+)$/, cameraCounter);
+    keyframeCounter = bumpCounter(file.keyframes.map((k) => k.id), /^kf-(\d+)$/, keyframeCounter);
+
+    set({
+      fileNames: file.fileNames,
+      partOrder: file.partOrder,
+      parts,
+      relations: file.relations,
+      groups: file.groups,
+      keyframes,
+      selectedPartId: null,
+      selectedGroupId: null,
+      selectedPartIds: new Set(),
+      pickedEntities: [],
+      editingRelationSide: null,
+      history: [],
+      future: [],
+      lastSolve: null,
+    });
   },
 }));

@@ -129,6 +129,7 @@ export function InspectorPanel() {
   const runSolve = useAssemblyStore((s) => s.runSolve);
   const pushHistorySnapshot = useAssemblyStore((s) => s.pushHistorySnapshot);
   const setAxisLock = useAssemblyStore((s) => s.setAxisLock);
+  const setCameraFov = useAssemblyStore((s) => s.setCameraFov);
   const [limitsOpen, setLimitsOpen] = useState(false);
 
   if (!selectedPartId) return null;
@@ -174,6 +175,21 @@ export function InspectorPanel() {
       <div className="mb-2 truncate text-[11px] font-semibold" style={{ color: "var(--text-bright)" }}>
         {state.part.name}
       </div>
+      {state.isCamera && (
+        <label className="mb-2 flex items-center gap-2 text-[11px]" style={{ color: "var(--text-dim)" }}>
+          Campo de visión (FOV)
+          <input
+            type="number"
+            min={1}
+            max={170}
+            value={Math.round(state.cameraFov ?? 50)}
+            onChange={(e) => setCameraFov(selectedPartId!, Number(e.target.value))}
+            className="w-16 rounded border px-1.5 py-0.5"
+            style={inputStyle}
+          />
+          °
+        </label>
+      )}
       <div className="mb-1.5 flex gap-2">
         {AXES.slice(0, 3).map(({ key, label }) => (
           <AxisField
