@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { memo, useCallback, useState } from "react";
 import { useAssemblyStore, type PartState } from "../assembly/store";
 import { partColor } from "../scene/colors";
 
@@ -35,18 +35,26 @@ export function TreePanel() {
   const [editingGroupId, setEditingGroupId] = useState<string | null>(null);
   const [editingName, setEditingName] = useState("");
 
-  function handlePartClick(e: React.MouseEvent, id: string) {
-    if (e.ctrlKey || e.metaKey) {
-      // A plain click only drives store selection, not multi-select — so the first
-      // Ctrl-click of a gesture needs to seed the set with whatever's already singly
-      // selected, or a lone Ctrl-click on a second part would never reach 2.
-      if (selectedPartIds.size === 0 && selectedPartId) toggleMultiSelect(selectedPartId);
-      toggleMultiSelect(id);
-      return;
-    }
-    clearMultiSelect();
-    selectPart(selectedPartId === id ? null : id);
-  }
+  // Stabilized with useCallback (deps limited to what selection logic actually reads)
+  // so its identity survives a pose-only re-render — PartRow is memoized specifically
+  // so a part untouched by the live pose updates during keyframe playback can skip
+  // re-rendering entirely, which only works if every prop it's given, callbacks
+  // included, stays referentially stable across those updates.
+  const handlePartClick = useCallback(
+    (e: React.MouseEvent, id: string) => {
+      if (e.ctrlKey || e.metaKey) {
+        // A plain click only drives store selection, not multi-select — so the first
+        // Ctrl-click of a gesture needs to seed the set with whatever's already singly
+        // selected, or a lone Ctrl-click on a second part would never reach 2.
+        if (selectedPartIds.size === 0 && selectedPartId) toggleMultiSelect(selectedPartId);
+        toggleMultiSelect(id);
+        return;
+      }
+      clearMultiSelect();
+      selectPart(selectedPartId === id ? null : id);
+    },
+    [selectedPartIds, selectedPartId, toggleMultiSelect, clearMultiSelect, selectPart],
+  );
 
   function handleGroupHeaderClick(groupId: string) {
     clearMultiSelect();
@@ -252,7 +260,11 @@ export function TreePanel() {
   );
 }
 
-function PartRow({
+// Memoized so a part left untouched by a solve (see applyPosesToParts in store.ts,
+// which preserves PartState object identity for anything that didn't actually move)
+// skips re-rendering when only OTHER parts' poses changed — matters most during
+// keyframe playback, which updates `parts` on every animation frame.
+const PartRow = memo(function PartRow({
   id,
   index,
   state,
@@ -335,4 +347,4 @@ function PartRow({
       </button>
     </div>
   );
-}
+});

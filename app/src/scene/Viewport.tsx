@@ -876,6 +876,14 @@ export function Viewport() {
       renderer.setViewport(0, 0, w, h);
     }
 
+    // The POV widget is a live preview, not something that needs to track the main
+    // render loop's own framerate — throttling it to ~20fps roughly halves the
+    // per-frame GPU cost of having a camera selected (it renders the *entire* scene a
+    // second time) with no visible smoothness loss, which matters a lot once that cost
+    // is compounding with keyframe playback's own per-frame solve+render on top of it.
+    const POV_INTERVAL_MS = 50;
+    let lastPovRenderTime = 0;
+
     let raf = 0;
     let lastFrameTime = performance.now();
     const animate = (now: number) => {
@@ -910,7 +918,10 @@ export function Viewport() {
       processDragFrame();
       renderer.render(scene, camera);
       const el = containerRef.current;
-      if (el && el.clientWidth > 0 && el.clientHeight > 0) renderPovWidget(el.clientWidth, el.clientHeight);
+      if (el && el.clientWidth > 0 && el.clientHeight > 0 && now - lastPovRenderTime >= POV_INTERVAL_MS) {
+        lastPovRenderTime = now;
+        renderPovWidget(el.clientWidth, el.clientHeight);
+      }
       raf = requestAnimationFrame(animate);
     };
     raf = requestAnimationFrame(animate);

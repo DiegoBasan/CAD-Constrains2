@@ -325,6 +325,34 @@ function buildAxisConstraints(parts: Map<string, PartState>): Map<string, AxisCo
   return map;
 }
 
+function posesEqual(a: Pose, b: Pose): boolean {
+  return (
+    a.position[0] === b.position[0] &&
+    a.position[1] === b.position[1] &&
+    a.position[2] === b.position[2] &&
+    a.quaternion[0] === b.quaternion[0] &&
+    a.quaternion[1] === b.quaternion[1] &&
+    a.quaternion[2] === b.quaternion[2] &&
+    a.quaternion[3] === b.quaternion[3]
+  );
+}
+
+/** Applies a solve result's poses onto `parts`, preserving each PartState's object
+ * identity for any part whose pose didn't actually change (a fixed part, or a free one
+ * untouched by every relation) — a solve result always covers every part, so without
+ * this every single PartState gets rewrapped in a new object on every call, which hands
+ * every panel subscribed to `parts` (TreePanel, RelationsPanel, InspectorPanel) a
+ * reason to re-render ALL of it on every animation frame during keyframe playback or a
+ * live drag, even the rows for parts that never moved. */
+function applyPosesToParts(parts: Map<string, PartState>, poses: Map<string, Pose>): Map<string, PartState> {
+  const next = new Map(parts);
+  for (const [id, pose] of poses) {
+    const e = next.get(id);
+    if (e && !posesEqual(e.pose, pose)) next.set(id, { ...e, pose });
+  }
+  return next;
+}
+
 function solveFromSeed(parts: Map<string, PartState>, relations: Relation[], seed: Map<string, Pose>) {
   const partMap = new Map<string, ImportedPart>();
   const poses = new Map<string, Pose>();
@@ -735,12 +763,7 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
       propagateRigidSeed(parts, relations, partId, pose, seed);
     }
     const result = solveFromSeed(parts, relations, seed);
-    const nextParts = new Map(parts);
-    for (const [id, pose] of result.poses) {
-      const e = nextParts.get(id);
-      if (e) nextParts.set(id, { ...e, pose });
-    }
-    set({ parts: nextParts });
+    set({ parts: applyPosesToParts(parts, result.poses) });
   },
 
   pickEntity: (ref) => {
@@ -1090,13 +1113,8 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
     const axisConstraints = buildAxisConstraints(parts);
     const result = solveAssembly({ parts: partMap, poses, fixedPartIds: fixedIds, relations, axisConstraints });
 
-    const nextParts = new Map(parts);
-    for (const [id, pose] of result.poses) {
-      const entry = nextParts.get(id);
-      if (entry) nextParts.set(id, { ...entry, pose });
-    }
     set({
-      parts: nextParts,
+      parts: applyPosesToParts(parts, result.poses),
       isSolving: false,
       lastSolve: { residualNorm: result.residualNorm, converged: result.converged },
     });
@@ -1111,13 +1129,7 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
     const seed = new Map<string, Pose>();
     propagateRigidSeed(parts, relations, partId, seedPose, seed);
     const result = solveFromSeed(parts, relations, seed);
-
-    const nextParts = new Map(parts);
-    for (const [id, pose] of result.poses) {
-      const e = nextParts.get(id);
-      if (e) nextParts.set(id, { ...e, pose });
-    }
-    set({ parts: nextParts });
+    set({ parts: applyPosesToParts(parts, result.poses) });
   },
 
   saveKeyframe: (name) => {
@@ -1146,13 +1158,8 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
     if (!kf) return;
     get().pushHistorySnapshot();
     const result = solveFromSeed(parts, relations, kf.poses);
-    const nextParts = new Map(parts);
-    for (const [pid, pose] of result.poses) {
-      const e = nextParts.get(pid);
-      if (e) nextParts.set(pid, { ...e, pose });
-    }
     set({
-      parts: nextParts,
+      parts: applyPosesToParts(parts, result.poses),
       selectedPartId: null,
       pickedEntities: [],
       lastSolve: { residualNorm: result.residualNorm, converged: result.converged },
@@ -1176,12 +1183,7 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
     function applySeed(seed: Map<string, Pose>) {
       const { parts, relations } = get();
       const result = solveFromSeed(parts, relations, seed);
-      const nextParts = new Map(parts);
-      for (const [id, pose] of result.poses) {
-        const e = nextParts.get(id);
-        if (e) nextParts.set(id, { ...e, pose });
-      }
-      set({ parts: nextParts });
+      set({ parts: applyPosesToParts(parts, result.poses) });
     }
 
     function runSegment(from: Map<string, Pose>, to: Map<string, Pose>): Promise<void> {
