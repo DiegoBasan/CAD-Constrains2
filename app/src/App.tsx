@@ -16,12 +16,22 @@ function isTextInput(el: EventTarget | null): boolean {
 export default function App() {
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
-      if (!(e.ctrlKey || e.metaKey) || e.key.toLowerCase() !== "z") return;
       if (isTextInput(e.target)) return;
-      e.preventDefault();
-      const store = useAssemblyStore.getState();
-      if (e.altKey) store.redo();
-      else store.undo();
+
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") {
+        e.preventDefault();
+        const store = useAssemblyStore.getState();
+        if (e.altKey) store.redo();
+        else store.undo();
+        return;
+      }
+
+      if (e.key === "Delete" || e.key === "Backspace") {
+        const store = useAssemblyStore.getState();
+        if (!store.selectedPartId || store.isPlaying) return;
+        e.preventDefault();
+        store.deletePart(store.selectedPartId);
+      }
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
@@ -45,9 +55,9 @@ export default function App() {
           <div className="min-h-0 flex-1">
             <RelationsPanel />
           </div>
-          <KeyframesPanel />
         </aside>
       </div>
+      <KeyframesPanel />
       <StatusBar />
     </div>
   );

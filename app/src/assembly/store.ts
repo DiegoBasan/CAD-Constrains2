@@ -94,6 +94,10 @@ interface AssemblyStore {
   cancelEditRelationSide: () => void;
 
   splitPart: (partId: string) => void;
+  deletePart: (partId: string) => void;
+
+  setRelationAngleLimits: (id: string, angleMin: number, angleMax: number) => void;
+  clearRelationAngleLimits: (id: string) => void;
 
   /** Records the current assembly data as an undo point — call right before a
    * mutation you want undoable (skip this for continuous updates like a live
@@ -115,6 +119,11 @@ interface AssemblyStore {
   saveKeyframe: (name?: string) => void;
   deleteKeyframe: (id: string) => void;
   renameKeyframe: (id: string, name: string) => void;
+  /** Jumps the live assembly to a saved keyframe's pose (re-solved, so it still
+   * respects every relation even if the assembly has changed since it was saved). */
+  previewKeyframe: (id: string) => void;
+  /** Replaces a keyframe's saved pose with the assembly's current one. */
+  overwriteKeyframe: (id: string) => void;
   playKeyframes: () => void;
   stopPlayback: () => void;
 
@@ -344,6 +353,56 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
     get().runSolve();
   },
 
+  deletePart: (partId) => {
+    const entry = get().parts.get(partId);
+    if (!entry) return;
+    get().pushHistorySnapshot();
+    const parts = new Map(get().parts);
+    parts.delete(partId);
+    const { selectedPartId, pickedEntities } = get();
+    set({
+      parts,
+      partOrder: get().partOrder.filter((id) => id !== partId),
+      relations: get().relations.filter((r) => r.a.partId !== partId && r.b.partId !== partId),
+      selectedPartId: selectedPartId === partId ? null : selectedPartId,
+      pickedEntities: pickedEntities.filter((e) => e.partId !== partId),
+    });
+    get().runSolve();
+  },
+
+  setRelationAngleLimits: (id, angleMin, angleMax) => {
+    const relation = get().relations.find((r) => r.id === id);
+    if (!relation) return;
+    get().pushHistorySnapshot();
+    const partA = get().parts.get(relation.a.partId);
+    const partB = get().parts.get(relation.b.partId);
+    if (!partA || !partB) return;
+    set({
+      relations: get().relations.map((r) =>
+        r.id === id
+          ? { ...r, angleMin, angleMax, refQuatA: [...partA.pose.quaternion], refQuatB: [...partB.pose.quaternion] }
+          : r,
+      ),
+    });
+    get().runSolve();
+  },
+
+  clearRelationAngleLimits: (id) => {
+    get().pushHistorySnapshot();
+    set({
+      relations: get().relations.map((r) => {
+        if (r.id !== id) return r;
+        const next = { ...r };
+        delete next.angleMin;
+        delete next.angleMax;
+        delete next.refQuatA;
+        delete next.refQuatB;
+        return next;
+      }),
+    });
+    get().runSolve();
+  },
+
   runSolve: () => {
     const { parts, relations } = get();
     if (parts.size === 0) return;
@@ -404,6 +463,34 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
 
   renameKeyframe: (id, name) => {
     set({ keyframes: get().keyframes.map((k) => (k.id === id ? { ...k, name: name.trim() || k.name } : k)) });
+  },
+
+  previewKeyframe: (id) => {
+    const { keyframes, parts, relations, isPlaying } = get();
+    if (isPlaying) return;
+    const kf = keyframes.find((k) => k.id === id);
+    if (!kf) return;
+    get().pushHistorySnapshot();
+    const result = solveFromSeed(parts, relations, kf.poses);
+    const nextParts = new Map(parts);
+    for (const [pid, pose] of result.poses) {
+      const e = nextParts.get(pid);
+      if (e) nextParts.set(pid, { ...e, pose });
+    }
+    set({
+      parts: nextParts,
+      selectedPartId: null,
+      pickedEntities: [],
+      lastSolve: { residualNorm: result.residualNorm, converged: result.converged },
+    });
+  },
+
+  overwriteKeyframe: (id) => {
+    const { parts, keyframes } = get();
+    if (parts.size === 0) return;
+    const poses = new Map<string, Pose>();
+    for (const [pid, st] of parts) poses.set(pid, st.pose);
+    set({ keyframes: keyframes.map((k) => (k.id === id ? { ...k, poses } : k)) });
   },
 
   playKeyframes: () => {
