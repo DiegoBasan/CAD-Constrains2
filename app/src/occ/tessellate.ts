@@ -185,6 +185,12 @@ export function tessellateShape(oc: OpenCascadeInstance, shape: OpenCascadeInsta
   };
 }
 
+// A sample roughly every 4 degrees of arc keeps circles/arcs looking smooth (a full
+// circle gets 90 segments) without over-sampling short arcs or fillets.
+const CURVE_SAMPLE_STEP_RAD = (4 * Math.PI) / 180;
+const CURVE_MIN_SAMPLES = 8;
+const CURVE_MAX_SAMPLES = 180;
+
 function extractEdges(oc: OpenCascadeInstance, shape: OpenCascadeInstance): EdgeInfo[] {
   const edges: EdgeInfo[] = [];
   const EDGE = oc.TopAbs_ShapeEnum.TopAbs_EDGE;
@@ -225,6 +231,28 @@ function extractEdges(oc: OpenCascadeInstance, shape: OpenCascadeInstance): Edge
       const len = Math.hypot(...direction) || 1;
       direction = [direction[0] / len, direction[1] / len, direction[2] / len];
 
+      // A "line" is exactly its two endpoints; any other curve type (circle, ellipse,
+      // b-spline, ...) is sampled along its true path — rendering it as the single
+      // start-to-end chord (as if it were a line) is what made curved edges look wrong,
+      // especially full or near-full circles where that chord can cut right across the
+      // circle instead of tracing its rim.
+      let polyline: Vec3[];
+      if (kind === "line") {
+        polyline = [[pa.X(), pa.Y(), pa.Z()], [pb.X(), pb.Y(), pb.Z()]];
+      } else {
+        const span = Math.abs(u1 - u0);
+        const samples = Math.max(
+          CURVE_MIN_SAMPLES,
+          Math.min(CURVE_MAX_SAMPLES, Math.ceil(span / CURVE_SAMPLE_STEP_RAD)),
+        );
+        polyline = new Array(samples + 1);
+        for (let i = 0; i <= samples; i++) {
+          const u = u0 + (span === 0 ? 0 : ((u1 - u0) * i) / samples);
+          const p = adaptor.Value(u);
+          polyline[i] = [p.X(), p.Y(), p.Z()];
+        }
+      }
+
       edges.push({
         id: id++,
         kind,
@@ -234,6 +262,7 @@ function extractEdges(oc: OpenCascadeInstance, shape: OpenCascadeInstance): Edge
         radius,
         a: [pa.X(), pa.Y(), pa.Z()],
         b: [pb.X(), pb.Y(), pb.Z()],
+        polyline,
       });
     } catch {
       // Skip edges whose curve type isn't handled (splines etc.) — not needed for mates.
@@ -282,6 +311,7 @@ export function recenterPartMesh(mesh: PartMesh): { mesh: PartMesh; origin: Vec3
     axisOrigin: e.axisOrigin ? shiftPoint(e.axisOrigin) : undefined,
     a: shiftPoint(e.a),
     b: shiftPoint(e.b),
+    polyline: e.polyline.map(shiftPoint),
   }));
 
   return {

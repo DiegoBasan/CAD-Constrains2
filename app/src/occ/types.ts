@@ -51,6 +51,11 @@ export interface EdgeInfo {
   radius?: number;
   a: Vec3; // start vertex
   b: Vec3; // end vertex
+  /** The edge's actual shape as a render-ready polyline (>=2 points) — for a "line"
+   * this is just [a, b], but a curved edge (circle/arc, or any other curve type) is
+   * sampled at several points along its true path so it's drawn as a curve rather than
+   * the single straight chord `a`-to-`b` would otherwise imply. */
+  polyline: Vec3[];
 }
 
 export interface ImportedPart {

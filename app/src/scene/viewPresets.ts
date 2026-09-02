@@ -10,7 +10,7 @@ const DIRECTIONS: Record<ViewPreset, { pos: THREE.Vector3; up: THREE.Vector3 }> 
 };
 
 export function applyViewPreset(
-  camera: THREE.OrthographicCamera,
+  camera: THREE.OrthographicCamera | THREE.PerspectiveCamera,
   target: THREE.Vector3,
   preset: ViewPreset,
   distance: number,
