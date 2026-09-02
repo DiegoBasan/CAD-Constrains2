@@ -37,6 +37,25 @@ export default function App() {
           store.deletePart(store.selectedPartId);
         }
       }
+
+      // Backs out of whatever's the most "modal" thing currently active, one step at a
+      // time — each of these previously needed a specific button click (Cancelar in
+      // RelationsPanel, Limpiar selección, Limpiar) with no keyboard escape hatch at
+      // all. Ordered from most to least "in the middle of a gesture."
+      if (e.key === "Escape") {
+        const store = useAssemblyStore.getState();
+        if (store.editingRelationSide) {
+          store.cancelEditRelationSide();
+        } else if (store.pickedEntities.length > 0) {
+          store.clearPicked();
+        } else if (store.selectedPartIds.size > 0) {
+          store.clearMultiSelect();
+        } else if (store.selectedPartId) {
+          store.selectPart(null);
+        } else if (store.selectedGroupId) {
+          store.selectGroup(null);
+        }
+      }
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
