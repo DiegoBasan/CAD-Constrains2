@@ -1,7 +1,7 @@
 import { useEffect, useRef } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
-import { useAssemblyStore, type CameraProjection, type RotatePivotMode, type ViewPreset } from "../assembly/store";
+import { useAssemblyStore, type CameraProjection, type PartState, type RotatePivotMode, type ViewPreset } from "../assembly/store";
 import type { ImportedPart } from "../occ/types";
 import { EDGE_COLOR, EDGE_HIGHLIGHT_COLOR, PICK_COLOR, SELECTED_PART_COLOR, UNIFORM_GRAY_COLOR, partColor } from "./colors";
 import { applyViewPreset } from "./viewPresets";
@@ -52,6 +52,14 @@ interface PartVisual {
    * part edges, so several places (edge-picking, body-color reconciliation) need to
    * treat it differently from a normal part's visual. */
   isCamera?: boolean;
+  /** The PartState object the reconcile effect last applied to this visual — see its
+   * use below: applyPosesToParts (store.ts) preserves a part's PartState object
+   * identity whenever a solve leaves its pose untouched, so comparing against this by
+   * reference (not value) is a cheap, correct way to tell "did anything about this
+   * specific part actually change" without diffing pose/color/etc. by hand — matters
+   * for a large assembly where most parts sit still on any given keyframe-playback
+   * frame while only a few actually move. */
+  lastReconciledState?: PartState;
 }
 
 const CAMERA_GIZMO_COLOR = 0xffcc55;
@@ -959,6 +967,18 @@ export function Viewport() {
     };
   }, []);
 
+  // Tracks the non-pose inputs the reconcile effect below also depends on — selection,
+  // picking, and color mode — so it can tell whether THIS run was triggered purely by a
+  // pose update (the common case during keyframe playback/live drag) versus one of
+  // these, which can change what ANY part's visual should look like and so always needs
+  // the full per-part pass. See lastReconciledState on PartVisual for the pose side.
+  const lastReconcileDepsRef = useRef<{
+    selectedPartId: string | null;
+    selectedPartIds: Set<string>;
+    pickedEntities: typeof pickedEntities;
+    colorMode: typeof colorMode;
+  } | null>(null);
+
   // --- reconcile part visuals against store state ---
   useEffect(() => {
     const scene = sceneRef.current;
@@ -980,6 +1000,20 @@ export function Viewport() {
       }
     }
 
+    // Only true when selection/picking/color-mode are byte-for-byte the same object
+    // references as last run — i.e. this run exists purely because some part's pose
+    // changed. A changed Set/array reference (even with the same logical contents)
+    // falls through to the full pass below; that's fine, it only costs the fast path on
+    // a rare event, never correctness.
+    const prevDeps = lastReconcileDepsRef.current;
+    const onlyPoseChanged =
+      prevDeps !== null &&
+      prevDeps.selectedPartId === selectedPartId &&
+      prevDeps.selectedPartIds === selectedPartIds &&
+      prevDeps.pickedEntities === pickedEntities &&
+      prevDeps.colorMode === colorMode;
+    lastReconcileDepsRef.current = { selectedPartId, selectedPartIds, pickedEntities, colorMode };
+
     partOrder.forEach((id, index) => {
       const state = parts.get(id);
       if (!state) return;
@@ -989,6 +1023,8 @@ export function Viewport() {
         scene.add(visual.group);
         visuals.set(id, visual);
       }
+      if (onlyPoseChanged && visual.lastReconciledState === state) return;
+      visual.lastReconciledState = state;
       visual.group.position.set(...state.pose.position);
       visual.group.quaternion.set(...state.pose.quaternion);
       visual.group.visible = state.visible;

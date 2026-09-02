@@ -374,7 +374,20 @@ function randomPerturbedPoses(base: Map<string, Pose>, freeIds: string[]): Map<s
 
 export function solveAssembly(input: SolveInput): SolveResult {
   const { parts, poses, fixedPartIds, relations, axisConstraints } = input;
-  const freeIds = Array.from(poses.keys()).filter((id) => !fixedPartIds.has(id));
+  // Only parts actually referenced by a relation need to be solver DOF — a free part
+  // nothing relates to has no residual pulling on it (an axis lock/limit on it would
+  // also start already satisfied, since nothing else ever moves it), so its optimal
+  // pose is trivially "stay put." Excluding it keeps the per-iteration FD Jacobian cost
+  // (O(m*n) in residuals x free-part DOF) proportional to how much of a large assembly
+  // is actually related, not to its total part count — matters once an assembly has
+  // many not-yet-related parts (e.g. a bin of loose screws) alongside a smaller
+  // constrained subassembly.
+  const relatedIds = new Set<string>();
+  for (const rel of relations) {
+    relatedIds.add(rel.a.partId);
+    relatedIds.add(rel.b.partId);
+  }
+  const freeIds = Array.from(poses.keys()).filter((id) => !fixedPartIds.has(id) && relatedIds.has(id));
 
   const outPoses = new Map(poses);
   if (freeIds.length === 0 || relations.length === 0) {
