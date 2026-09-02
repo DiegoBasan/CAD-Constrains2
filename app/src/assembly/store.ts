@@ -5,6 +5,10 @@ import { countConnectedBodies, splitPartMesh } from "../occ/split";
 import { applicableRelationTypes, resolveEntity, type Relation, type RelationType } from "./relations";
 import { solveAssembly } from "./solver";
 
+/** One editable coordinate: world-frame X/Y/Z position (mm) or Rx/Ry/Rz Euler-XYZ
+ * rotation (degrees) — matches exactly what InspectorPanel's six AxisFields show. */
+export type AxisKey = "x" | "y" | "z" | "rx" | "ry" | "rz";
+
 export interface PartState {
   part: ImportedPart;
   pose: Pose;
@@ -19,6 +23,14 @@ export interface PartState {
    * convenience: selecting the group and dragging any member moves every member by
    * the same rigid delta together. */
   groupId?: string;
+  /** Per-axis lock: a locked axis is held at its current value across any interactive
+   * edit (viewport drag, inspector field, group drag) — like "fijar" but for a single
+   * coordinate instead of the whole part. Not enforced against relations inside the
+   * solver, only at the interaction boundary (see `clampToAxisConstraints`). */
+  axisLock?: Partial<Record<AxisKey, boolean>>;
+  /** Per-axis [min, max] clamp (mm for x/y/z, degrees for rx/ry/rz), enforced the same
+   * way as `axisLock`. */
+  axisLimits?: Partial<Record<AxisKey, [number, number]>>;
 }
 
 /** A folder of parts that move together in the viewport (see PartState.groupId) —
@@ -31,6 +43,7 @@ export interface Group {
 
 export type ViewPreset = "iso" | "front" | "top" | "right";
 export type CameraProjection = "ortho" | "perspective";
+export type ColorMode = "palette" | "gray";
 export type TransformMode = "translate" | "rotate";
 /** Which pivot a rotate-drag turns the selected part around: "part" spins it in place
  * about its own origin, "camera" orbits it (position and orientation both) about the
@@ -88,6 +101,13 @@ interface AssemblyStore {
   rotatePivotMode: RotatePivotMode;
   requestedView: ViewPreset | null;
   cameraProjection: CameraProjection;
+  /** Perspective camera field of view in degrees (0-90, Shapr3D-style "amount of
+   * perspective" slider) — only meaningful while `cameraProjection === "perspective"`.
+   * Changing it also dollies the camera to keep the currently-framed content the same
+   * apparent size (see `switchCamera`/the fov-change effect in Viewport.tsx), so the
+   * slider reads as "how much perspective distortion", not "zoom". */
+  perspectiveFov: number;
+  colorMode: ColorMode;
 
   isSolving: boolean;
   lastSolve: { residualNorm: number; converged: boolean } | null;
@@ -117,6 +137,20 @@ interface AssemblyStore {
   requestView: (view: ViewPreset) => void;
   consumeRequestedView: () => void;
   setCameraProjection: (projection: CameraProjection) => void;
+  setPerspectiveFov: (fov: number) => void;
+  setColorMode: (mode: ColorMode) => void;
+
+  setAxisLock: (partId: string, axis: AxisKey, locked: boolean) => void;
+  setAxisLimits: (partId: string, axis: AxisKey, min: number, max: number) => void;
+  clearAxisLimits: (partId: string, axis: AxisKey) => void;
+
+  /** Combines several parts' meshes into a single new part, baking each source part's
+   * current relative pose into the merged geometry — a lightweight, non-boolean union
+   * (the app doesn't retain OCCT shapes past import, so a true geometric fuse isn't
+   * available at runtime). Meant for treating a cluster of parts as one object for
+   * relation-authoring purposes in a large assembly. Any relation touching a merged
+   * part is dropped, since its faces/edges no longer exist as separate entities. */
+  mergeParts: (partIds: string[], name?: string) => void;
 
   addRelation: (type: RelationType, value: number) => void;
   removeRelation: (id: string) => void;
@@ -186,6 +220,55 @@ function solveFromSeed(parts: Map<string, PartState>, relations: Relation[], see
   return solveAssembly({ parts: partMap, poses, fixedPartIds: fixedIds, relations, restarts: 0 });
 }
 
+const POSITION_AXES: AxisKey[] = ["x", "y", "z"];
+const ROTATION_AXES: AxisKey[] = ["rx", "ry", "rz"];
+
+/** Enforces a part's per-axis lock/limits on a proposed pose patch, at the interaction
+ * boundary — a locked axis is snapped back to its current value, a limited axis is
+ * clamped into range, everything else passes through unchanged. Shared by every path
+ * that can move a part interactively (single-part drag, group drag, inspector edits),
+ * so the constraint holds however the part is being moved. */
+function clampToAxisConstraints(entry: PartState, patch: { position?: Vec3; quaternion?: Quat }): { position?: Vec3; quaternion?: Quat } {
+  const { axisLock, axisLimits } = entry;
+  if (!axisLock && !axisLimits) return patch;
+
+  let position = patch.position;
+  if (position) {
+    const cur = entry.pose.position;
+    position = [...position] as Vec3;
+    POSITION_AXES.forEach((axis, i) => {
+      if (axisLock?.[axis]) {
+        position![i] = cur[i];
+        return;
+      }
+      const range = axisLimits?.[axis];
+      if (range) position![i] = THREE.MathUtils.clamp(position![i], range[0], range[1]);
+    });
+  }
+
+  let quaternion = patch.quaternion;
+  if (quaternion && (ROTATION_AXES.some((a) => axisLock?.[a]) || ROTATION_AXES.some((a) => axisLimits?.[a]))) {
+    const curEuler = new THREE.Euler().setFromQuaternion(new THREE.Quaternion(...entry.pose.quaternion), "XYZ");
+    const nextEuler = new THREE.Euler().setFromQuaternion(new THREE.Quaternion(...quaternion), "XYZ");
+    const curDeg = [THREE.MathUtils.radToDeg(curEuler.x), THREE.MathUtils.radToDeg(curEuler.y), THREE.MathUtils.radToDeg(curEuler.z)];
+    const nextDeg = [THREE.MathUtils.radToDeg(nextEuler.x), THREE.MathUtils.radToDeg(nextEuler.y), THREE.MathUtils.radToDeg(nextEuler.z)];
+    ROTATION_AXES.forEach((axis, i) => {
+      if (axisLock?.[axis]) {
+        nextDeg[i] = curDeg[i];
+        return;
+      }
+      const range = axisLimits?.[axis];
+      if (range) nextDeg[i] = THREE.MathUtils.clamp(nextDeg[i], range[0], range[1]);
+    });
+    const q = new THREE.Quaternion().setFromEuler(
+      new THREE.Euler(THREE.MathUtils.degToRad(nextDeg[0]), THREE.MathUtils.degToRad(nextDeg[1]), THREE.MathUtils.degToRad(nextDeg[2]), "XYZ"),
+    );
+    quaternion = [q.x, q.y, q.z, q.w];
+  }
+
+  return { position, quaternion };
+}
+
 function lerpPose(a: Pose, b: Pose, t: number): Pose {
   const position = new THREE.Vector3(...a.position).lerp(new THREE.Vector3(...b.position), t);
   const quaternion = new THREE.Quaternion(...a.quaternion).slerp(new THREE.Quaternion(...b.quaternion), t);
@@ -215,6 +298,8 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
   rotatePivotMode: "part",
   requestedView: "iso",
   cameraProjection: "ortho",
+  perspectiveFov: 50,
+  colorMode: "palette",
 
   isSolving: false,
   lastSolve: null,
@@ -308,7 +393,8 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
     for (const { partId, position, quaternion } of patches) {
       const entry = parts.get(partId);
       if (!entry) continue;
-      seed.set(partId, { position: position ?? entry.pose.position, quaternion: quaternion ?? entry.pose.quaternion });
+      const constrained = clampToAxisConstraints(entry, { position, quaternion });
+      seed.set(partId, { position: constrained.position ?? entry.pose.position, quaternion: constrained.quaternion ?? entry.pose.quaternion });
     }
     const result = solveFromSeed(parts, relations, seed);
     const nextParts = new Map(parts);
@@ -374,6 +460,157 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
   requestView: (view) => set({ requestedView: view }),
   consumeRequestedView: () => set({ requestedView: null }),
   setCameraProjection: (projection) => set({ cameraProjection: projection }),
+  setPerspectiveFov: (fov) => set({ perspectiveFov: THREE.MathUtils.clamp(fov, 1, 90) }),
+  setColorMode: (mode) => set({ colorMode: mode }),
+
+  setAxisLock: (partId, axis, locked) => {
+    const entry = get().parts.get(partId);
+    if (!entry) return;
+    get().pushHistorySnapshot();
+    const parts = new Map(get().parts);
+    parts.set(partId, { ...entry, axisLock: { ...entry.axisLock, [axis]: locked } });
+    set({ parts });
+  },
+
+  setAxisLimits: (partId, axis, min, max) => {
+    const entry = get().parts.get(partId);
+    if (!entry) return;
+    get().pushHistorySnapshot();
+    const parts = new Map(get().parts);
+    const updated: PartState = { ...entry, axisLimits: { ...entry.axisLimits, [axis]: [min, max] } };
+    // If the part's current pose already falls outside the new range, snap it in now —
+    // otherwise the limit would only start biting on the *next* interactive edit.
+    const constrained = clampToAxisConstraints(updated, updated.pose);
+    updated.pose = { position: constrained.position ?? updated.pose.position, quaternion: constrained.quaternion ?? updated.pose.quaternion };
+    parts.set(partId, updated);
+    set({ parts });
+    get().runSolve();
+  },
+
+  clearAxisLimits: (partId, axis) => {
+    const entry = get().parts.get(partId);
+    if (!entry) return;
+    get().pushHistorySnapshot();
+    const parts = new Map(get().parts);
+    const axisLimits = { ...entry.axisLimits };
+    delete axisLimits[axis];
+    parts.set(partId, { ...entry, axisLimits });
+    set({ parts });
+  },
+
+  mergeParts: (partIds, name) => {
+    const { parts: allParts } = get();
+    const ids = partIds.filter((id) => allParts.has(id));
+    if (ids.length < 2) return;
+    get().pushHistorySnapshot();
+
+    const first = allParts.get(ids[0])!;
+    const basePos = new THREE.Vector3(...first.pose.position);
+    const baseQuat = new THREE.Quaternion(...first.pose.quaternion);
+    const baseQuatInv = baseQuat.clone().invert();
+
+    const positions: number[] = [];
+    const normals: number[] = [];
+    const indices: number[] = [];
+    const triangleFaceId: number[] = [];
+    const faces: PartState["part"]["mesh"]["faces"] = [];
+    const edges: PartState["part"]["mesh"]["edges"] = [];
+    let faceIdCounter = 0;
+    let edgeIdCounter = 0;
+    let vertexBase = 0;
+
+    const transformPoint = (p: Vec3, pos: THREE.Vector3, quat: THREE.Quaternion): Vec3 => {
+      // World position under `pos`/`quat`, then re-expressed relative to the merged
+      // part's own frame (the first source part's pose) — exactly mirrors how a
+      // group's members keep their real-world placement when treated as one object.
+      const world = new THREE.Vector3(...p).applyQuaternion(quat).add(pos);
+      const local = world.sub(basePos).applyQuaternion(baseQuatInv);
+      return [local.x, local.y, local.z];
+    };
+    const transformDir = (d: Vec3, quat: THREE.Quaternion): Vec3 => {
+      const world = new THREE.Vector3(...d).applyQuaternion(quat);
+      const local = world.applyQuaternion(baseQuatInv);
+      return [local.x, local.y, local.z];
+    };
+
+    for (const id of ids) {
+      const entry = allParts.get(id)!;
+      const pos = new THREE.Vector3(...entry.pose.position);
+      const quat = new THREE.Quaternion(...entry.pose.quaternion);
+      const mesh = entry.part.mesh;
+      const vCount = mesh.positions.length / 3;
+      for (let i = 0; i < vCount; i++) {
+        const [x, y, z] = transformPoint([mesh.positions[i * 3], mesh.positions[i * 3 + 1], mesh.positions[i * 3 + 2]], pos, quat);
+        positions.push(x, y, z);
+        const [nx, ny, nz] = transformDir([mesh.normals[i * 3], mesh.normals[i * 3 + 1], mesh.normals[i * 3 + 2]], quat);
+        normals.push(nx, ny, nz);
+      }
+      for (let i = 0; i < mesh.indices.length; i++) indices.push(mesh.indices[i] + vertexBase);
+      const faceIdMap = new Map<number, number>();
+      for (const f of mesh.faces) {
+        const newId = faceIdCounter++;
+        faceIdMap.set(f.id, newId);
+        faces.push({
+          ...f,
+          id: newId,
+          point: transformPoint(f.point, pos, quat),
+          normal: transformDir(f.normal, quat),
+          axisOrigin: f.axisOrigin ? transformPoint(f.axisOrigin, pos, quat) : undefined,
+        });
+      }
+      for (let i = 0; i < mesh.triangleFaceId.length; i++) {
+        triangleFaceId.push(faceIdMap.get(mesh.triangleFaceId[i]) ?? -1);
+      }
+      for (const e of mesh.edges) {
+        edges.push({
+          ...e,
+          id: edgeIdCounter++,
+          point: transformPoint(e.point, pos, quat),
+          direction: transformDir(e.direction, quat),
+          axisOrigin: e.axisOrigin ? transformPoint(e.axisOrigin, pos, quat) : undefined,
+          a: transformPoint(e.a, pos, quat),
+          b: transformPoint(e.b, pos, quat),
+          polyline: e.polyline.map((p) => transformPoint(p, pos, quat)),
+        });
+      }
+      vertexBase += vCount;
+    }
+
+    const mergedId = `merge-${importCounter++}`;
+    const mergedPose: Pose = { position: [...first.pose.position], quaternion: [...first.pose.quaternion] };
+    const parts = new Map(allParts);
+    for (const id of ids) parts.delete(id);
+    parts.set(mergedId, {
+      part: {
+        id: mergedId,
+        name: name?.trim() || `${first.part.name} (unida)`,
+        mesh: {
+          positions: new Float32Array(positions),
+          normals: new Float32Array(normals),
+          indices: new Uint32Array(indices),
+          triangleFaceId: new Int32Array(triangleFaceId),
+          faces,
+          edges,
+        },
+        initialPose: mergedPose,
+      },
+      pose: mergedPose,
+      fixed: ids.some((id) => allParts.get(id)!.fixed),
+      visible: true,
+      canSplit: false,
+    });
+
+    const idSet = new Set(ids);
+    set({
+      parts,
+      partOrder: [...get().partOrder.filter((id) => !idSet.has(id)), mergedId],
+      relations: get().relations.filter((r) => !idSet.has(r.a.partId) && !idSet.has(r.b.partId)),
+      selectedPartId: mergedId,
+      selectedGroupId: null,
+      pickedEntities: [],
+    });
+    get().runSolve();
+  },
 
   addRelation: (type, value) => {
     const [a, b] = get().pickedEntities;
@@ -530,7 +767,8 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
     const { parts, relations } = get();
     const entry = parts.get(partId);
     if (!entry) return;
-    const seedPose: Pose = { position: patch.position ?? entry.pose.position, quaternion: patch.quaternion ?? entry.pose.quaternion };
+    const constrained = clampToAxisConstraints(entry, patch);
+    const seedPose: Pose = { position: constrained.position ?? entry.pose.position, quaternion: constrained.quaternion ?? entry.pose.quaternion };
     const result = solveFromSeed(parts, relations, new Map([[partId, seedPose]]));
 
     const nextParts = new Map(parts);

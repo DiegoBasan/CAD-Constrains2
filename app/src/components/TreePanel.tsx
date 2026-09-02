@@ -13,6 +13,7 @@ export function TreePanel() {
   const createGroup = useAssemblyStore((s) => s.createGroup);
   const ungroupParts = useAssemblyStore((s) => s.ungroupParts);
   const renameGroup = useAssemblyStore((s) => s.renameGroup);
+  const mergeParts = useAssemblyStore((s) => s.mergeParts);
   const toggleFixed = useAssemblyStore((s) => s.toggleFixed);
   const toggleVisible = useAssemblyStore((s) => s.toggleVisible);
   const splitPart = useAssemblyStore((s) => s.splitPart);
@@ -65,16 +66,30 @@ export function TreePanel() {
       >
         <span>Piezas</span>
         {multiSelected.size >= 2 && (
-          <button
-            onClick={() => {
-              createGroup(Array.from(multiSelected));
-              setMultiSelected(new Set());
-            }}
-            className="rounded px-2 py-0.5 text-[11px] font-medium normal-case hover:opacity-80"
-            style={{ background: "var(--accent-bg)", color: "var(--accent)" }}
-          >
-            Agrupar ({multiSelected.size})
-          </button>
+          <div className="flex items-center gap-1.5">
+            <button
+              onClick={() => {
+                createGroup(Array.from(multiSelected));
+                setMultiSelected(new Set());
+              }}
+              title="Cada pieza sigue siendo independiente, pero se mueven juntas al arrastrar cualquier miembro"
+              className="rounded px-2 py-0.5 text-[11px] font-medium normal-case hover:opacity-80"
+              style={{ background: "var(--accent-bg)", color: "var(--accent)" }}
+            >
+              Agrupar ({multiSelected.size})
+            </button>
+            <button
+              onClick={() => {
+                mergeParts(Array.from(multiSelected));
+                setMultiSelected(new Set());
+              }}
+              title="Combina las piezas seleccionadas en una sola (une sus mallas, ya no se pueden mover por separado)"
+              className="rounded px-2 py-0.5 text-[11px] font-medium normal-case hover:opacity-80"
+              style={{ background: "var(--bg-3)", color: "var(--text-bright)", border: "1px solid var(--border-strong)" }}
+            >
+              Unir ({multiSelected.size})
+            </button>
+          </div>
         )}
       </div>
       <div className="flex-1 overflow-y-auto">

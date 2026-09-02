@@ -1,14 +1,12 @@
 import { useEffect, useRef } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
-import { useAssemblyStore, type CameraProjection, type RotatePivotMode } from "../assembly/store";
+import { useAssemblyStore, type CameraProjection, type RotatePivotMode, type ViewPreset } from "../assembly/store";
 import type { ImportedPart } from "../occ/types";
-import { EDGE_COLOR, EDGE_HIGHLIGHT_COLOR, PICK_COLOR, SELECTED_PART_COLOR, partColor } from "./colors";
+import { EDGE_COLOR, EDGE_HIGHLIGHT_COLOR, PICK_COLOR, SELECTED_PART_COLOR, UNIFORM_GRAY_COLOR, partColor } from "./colors";
 import { applyViewPreset } from "./viewPresets";
 
 type SceneCamera = THREE.OrthographicCamera | THREE.PerspectiveCamera;
-
-const PERSPECTIVE_FOV = 50;
 
 /** How far the camera needs to sit from `target` to frame a sphere of `radius` —
  * for orthographic the visible extent comes from left/right/top/bottom instead, so
@@ -252,6 +250,9 @@ export function Viewport() {
   const latestPointerRef = useRef<{ x: number; y: number } | null>(null);
   const viewSizeRef = useRef(200);
   const switchCameraRef = useRef<((kind: CameraProjection) => void) | null>(null);
+  const setFovRef = useRef<((fov: number) => void) | null>(null);
+  const applyPresetRef = useRef<((preset: ViewPreset) => void) | null>(null);
+  const frameContentRef = useRef<((center: THREE.Vector3, radius: number, aspect: number) => void) | null>(null);
 
   const parts = useAssemblyStore((s) => s.parts);
   const partOrder = useAssemblyStore((s) => s.partOrder);
@@ -261,9 +262,18 @@ export function Viewport() {
   const consumeRequestedView = useAssemblyStore((s) => s.consumeRequestedView);
   const importVersion = useAssemblyStore((s) => s.importVersion);
   const cameraProjection = useAssemblyStore((s) => s.cameraProjection);
+  const perspectiveFov = useAssemblyStore((s) => s.perspectiveFov);
+  const colorMode = useAssemblyStore((s) => s.colorMode);
   // Read once as the initial camera-kind seed on mount; later changes are picked up by the
   // separate switchCameraRef-driven effect below, not by re-running scene setup.
   const initialProjectionRef = useRef(cameraProjection);
+  // Mirrors the latest fov (not read-once) — makePerspectiveCamera/switchCamera read it
+  // lazily so switching *into* perspective later picks up whatever the slider is
+  // currently set to, not just its value at mount.
+  const perspectiveFovRef = useRef(perspectiveFov);
+  useEffect(() => {
+    perspectiveFovRef.current = perspectiveFov;
+  }, [perspectiveFov]);
 
   // --- one-time scene setup ---
   useEffect(() => {
@@ -283,7 +293,7 @@ export function Viewport() {
       return new THREE.OrthographicCamera(-viewSize * aspect, viewSize * aspect, viewSize, -viewSize, -100000, 100000);
     }
     function makePerspectiveCamera(): THREE.PerspectiveCamera {
-      return new THREE.PerspectiveCamera(PERSPECTIVE_FOV, aspect, 0.1, 100000);
+      return new THREE.PerspectiveCamera(perspectiveFovRef.current, aspect, 0.1, 100000);
     }
 
     // `camera`/`orbit` are reassigned (not just mutated) when the projection mode
@@ -311,16 +321,29 @@ export function Viewport() {
     scene.add(grid);
 
     const target = new THREE.Vector3(0, 0, 0);
-    function makeOrbit(cam: SceneCamera): OrbitControls {
+    // `targetPoint` defaults to the origin (used only for the very first orbit, before
+    // any orbit has ever existed to read a target from) — every rebuild afterwards
+    // passes the outgoing orbit's own (possibly panned-away-from-origin) target
+    // explicitly, so rebuilding orbit controls (projection switch, preset switch)
+    // never silently snaps a panned view back to the origin.
+    function makeOrbit(cam: SceneCamera, targetPoint: THREE.Vector3 = target): OrbitControls {
       const controls = new OrbitControls(cam, renderer.domElement);
-      controls.target.copy(target);
+      controls.target.copy(targetPoint);
       controls.enableDamping = true;
       controls.dampingFactor = 0.08;
       return controls;
     }
+    // Apply the (Z-up) view preset — which sets `camera.up` — *before* constructing
+    // OrbitControls: it reads `camera.up` exactly once, at construction, to build the
+    // quaternion it uses internally to realign every rotate into a Y-up frame. Doing
+    // this in the other order (as it used to be) leaves that first orbit instance
+    // permanently built around the default Y-up assumption a freshly-constructed
+    // THREE.Camera starts with, silently breaking mouse-drag orbit until the next
+    // projection switch (which happens to set `up` before making its own new
+    // OrbitControls) rebuilds it correctly.
+    applyViewPreset(camera, target, "iso", fitDistance(camera, viewSizeRef.current));
     let orbit = makeOrbit(camera);
     orbitRef.current = orbit;
-    applyViewPreset(camera, target, "iso", fitDistance(camera, viewSizeRef.current));
     orbit.update();
 
     function switchCamera(kind: CameraProjection) {
@@ -328,15 +351,16 @@ export function Viewport() {
       if ((kind === "perspective") === isPerspective) return;
       const oldPos = camera.position.clone();
       const oldUp = camera.up.clone();
-      const distance = oldPos.distanceTo(orbit.target) || 300;
+      const oldTarget = orbit.target.clone();
+      const distance = oldPos.distanceTo(oldTarget) || 300;
 
       const next = kind === "perspective" ? makePerspectiveCamera() : makeOrthoCamera();
       next.up.copy(oldUp);
       // Preserve the current view direction, re-deriving distance so the framed
       // content stays about the same apparent size across the switch.
-      const dir = oldPos.clone().sub(orbit.target).normalize();
-      next.position.copy(orbit.target).add(dir.multiplyScalar(fitDistance(next, viewSizeRef.current) || distance));
-      next.lookAt(orbit.target);
+      const dir = oldPos.clone().sub(oldTarget).normalize();
+      next.position.copy(oldTarget).add(dir.multiplyScalar(fitDistance(next, viewSizeRef.current) || distance));
+      next.lookAt(oldTarget);
 
       const w = containerRef.current?.clientWidth || width;
       const h = containerRef.current?.clientHeight || height;
@@ -344,12 +368,61 @@ export function Viewport() {
 
       orbit.dispose();
       camera = next;
-      orbit = makeOrbit(camera);
+      orbit = makeOrbit(camera, oldTarget);
       orbit.update();
       cameraRef.current = camera;
       orbitRef.current = orbit;
     }
     switchCameraRef.current = switchCamera;
+
+    // Rebuilds OrbitControls after every preset switch, not just projection switches —
+    // "Superior" is the one preset with a different up vector ((0,1,0) vs the other
+    // three's (0,0,1)), and applyViewPreset changes `camera.up` directly without
+    // touching `orbit`; left alone, orbit's cached up-alignment quaternion (see the
+    // comment above `let orbit = makeOrbit(camera)`) would go stale the same way,
+    // silently breaking mouse-drag orbit after switching to/from Superior.
+    function applyPreset(preset: ViewPreset) {
+      const oldTarget = orbit.target.clone();
+      const distance = camera.position.distanceTo(oldTarget) || 300;
+      applyViewPreset(camera, oldTarget, preset, distance);
+      orbit.dispose();
+      orbit = makeOrbit(camera, oldTarget);
+      orbit.update();
+      orbitRef.current = orbit;
+    }
+    applyPresetRef.current = applyPreset;
+
+    // Frames a bounding sphere (center/radius) in ISO view, e.g. after a fresh import —
+    // same up-vector/orbit-rebuild reasoning as `applyPreset`: this always resets to
+    // the ISO preset's up vector, which needs a fresh OrbitControls to match.
+    function frameContent(center: THREE.Vector3, radius: number, aspect: number) {
+      fitCameraFrustum(camera, radius, aspect);
+      applyViewPreset(camera, center, "iso", fitDistance(camera, radius));
+      orbit.dispose();
+      orbit = makeOrbit(camera, center);
+      orbit.update();
+      orbitRef.current = orbit;
+    }
+    frameContentRef.current = frameContent;
+
+    // Shapr3D-style "amount of perspective" slider: changes the PerspectiveCamera's
+    // fov while dollying the camera so whatever's currently framed stays about the
+    // same apparent size — a classic dolly-zoom, so the slider reads as "how much
+    // perspective distortion" rather than "zoom in/out". No-op while the camera is
+    // orthographic (there's no fov to vary); the store value still updates so the
+    // next switch to perspective picks it up via `perspectiveFovRef`.
+    function setFov(fov: number) {
+      if (!(camera instanceof THREE.PerspectiveCamera)) return;
+      const oldDistance = camera.position.distanceTo(orbit.target) || 300;
+      const apparentRadius = oldDistance * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
+      camera.fov = fov;
+      const newDistance = apparentRadius / Math.tan(THREE.MathUtils.degToRad(fov / 2));
+      const dir = camera.position.clone().sub(orbit.target).normalize();
+      camera.position.copy(orbit.target).add(dir.multiplyScalar(newDistance));
+      camera.updateProjectionMatrix();
+      orbit.update();
+    }
+    setFovRef.current = setFov;
 
     const raycaster = new THREE.Raycaster();
     const dom = renderer.domElement;
@@ -726,7 +799,8 @@ export function Viewport() {
       visual.group.position.set(...state.pose.position);
       visual.group.quaternion.set(...state.pose.quaternion);
       visual.group.visible = state.visible;
-      visual.material.color.setHex(id === selectedPartId ? SELECTED_PART_COLOR : visual.baseColor);
+      const bodyColor = colorMode === "gray" ? UNIFORM_GRAY_COLOR : visual.baseColor;
+      visual.material.color.setHex(id === selectedPartId ? SELECTED_PART_COLOR : bodyColor);
 
       if (visual.highlightMesh) {
         visual.group.remove(visual.highlightMesh);
@@ -746,22 +820,22 @@ export function Viewport() {
       const pickedEdge = pickedEntities.find((e) => e.partId === id && e.kind === "edge");
       updateEdgeHighlight(visual, state.part, pickedEdge?.id ?? null);
     });
-  }, [parts, partOrder, selectedPartId, pickedEntities]);
+  }, [parts, partOrder, selectedPartId, pickedEntities, colorMode]);
 
   // --- camera projection toggle (ortho <-> perspective) ---
   useEffect(() => {
     switchCameraRef.current?.(cameraProjection);
   }, [cameraProjection]);
 
+  // --- perspective amount slider (dolly-zoom fov change) ---
+  useEffect(() => {
+    setFovRef.current?.(perspectiveFov);
+  }, [perspectiveFov]);
+
   // --- view preset requests ---
   useEffect(() => {
     if (!requestedView) return;
-    const camera = cameraRef.current;
-    const orbit = orbitRef.current;
-    if (!camera || !orbit) return;
-    const distance = camera.position.distanceTo(orbit.target) || 300;
-    applyViewPreset(camera, orbit.target, requestedView, distance);
-    orbit.update();
+    applyPresetRef.current?.(requestedView);
     consumeRequestedView();
   }, [requestedView, consumeRequestedView]);
 
@@ -769,9 +843,6 @@ export function Viewport() {
   useEffect(() => {
     if (importVersion === 0) return;
     const raf = requestAnimationFrame(() => {
-      const camera = cameraRef.current;
-      const orbit = orbitRef.current;
-      if (!camera || !orbit) return;
       const box = new THREE.Box3();
       for (const visual of visualsRef.current.values()) box.expandByObject(visual.group);
       if (box.isEmpty()) return;
@@ -781,10 +852,7 @@ export function Viewport() {
       viewSizeRef.current = radius;
       const el = containerRef.current;
       const aspect = el && el.clientHeight > 0 ? el.clientWidth / el.clientHeight : 1;
-      fitCameraFrustum(camera, radius, aspect);
-      orbit.target.copy(center);
-      applyViewPreset(camera, center, "iso", fitDistance(camera, radius));
-      orbit.update();
+      frameContentRef.current?.(center, radius, aspect);
     });
     return () => cancelAnimationFrame(raf);
   }, [importVersion]);

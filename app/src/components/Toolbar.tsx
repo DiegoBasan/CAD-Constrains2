@@ -1,4 +1,4 @@
-import { useAssemblyStore, type ViewPreset, type CameraProjection, type TransformMode, type RotatePivotMode } from "../assembly/store";
+import { useAssemblyStore, type ViewPreset, type CameraProjection, type ColorMode, type TransformMode, type RotatePivotMode } from "../assembly/store";
 import { ImportButton } from "./ImportButton";
 
 const VIEWS: { id: ViewPreset; label: string }[] = [
@@ -22,6 +22,11 @@ const PIVOT_MODES: { id: RotatePivotMode; label: string; title: string }[] = [
   { id: "part", label: "Pieza", title: "Gira sobre el propio centro de la pieza" },
   { id: "camera", label: "Cámara", title: "Gira alrededor del punto que mira la cámara" },
   { id: "free", label: "Libre", title: "Giro libre tipo bola (arcball), sin eje fijo" },
+];
+
+const COLOR_MODES: { id: ColorMode; label: string; title: string }[] = [
+  { id: "palette", label: "Colores", title: "Cada pieza con su propio color" },
+  { id: "gray", label: "Gris", title: "Todas las piezas en gris uniforme rgb(173,173,177)" },
 ];
 
 function ToolbarButton({
@@ -61,6 +66,10 @@ export function Toolbar() {
   const setRotatePivotMode = useAssemblyStore((s) => s.setRotatePivotMode);
   const cameraProjection = useAssemblyStore((s) => s.cameraProjection);
   const setCameraProjection = useAssemblyStore((s) => s.setCameraProjection);
+  const perspectiveFov = useAssemblyStore((s) => s.perspectiveFov);
+  const setPerspectiveFov = useAssemblyStore((s) => s.setPerspectiveFov);
+  const colorMode = useAssemblyStore((s) => s.colorMode);
+  const setColorMode = useAssemblyStore((s) => s.setColorMode);
   const fileNames = useAssemblyStore((s) => s.fileNames);
   const partCount = useAssemblyStore((s) => s.partOrder.length);
 
@@ -95,6 +104,41 @@ export function Toolbar() {
             onClick={() => setCameraProjection(p.id)}
           >
             {p.label}
+          </ToolbarButton>
+        ))}
+      </div>
+
+      {cameraProjection === "perspective" && (
+        <div className="flex items-center gap-1.5 pl-3" style={{ borderLeft: "1px solid var(--border)" }}>
+          <span className="text-[11px]" style={{ color: "var(--text-dim)" }}>
+            Perspectiva
+          </span>
+          <input
+            type="range"
+            min={1}
+            max={90}
+            step={1}
+            value={perspectiveFov}
+            onChange={(e) => setPerspectiveFov(Number(e.target.value))}
+            title="Cantidad de perspectiva (estilo Shapr3D) — de casi ortográfica a muy pronunciada"
+            className="w-24"
+          />
+          <span className="w-7 text-right text-[11px] tabular-nums" style={{ color: "var(--text-dim)" }}>
+            {Math.round(perspectiveFov)}°
+          </span>
+        </div>
+      )}
+
+      <div className="flex items-center gap-1 pl-3" style={{ borderLeft: "1px solid var(--border)" }}>
+        {COLOR_MODES.map((c) => (
+          <ToolbarButton
+            key={c.id}
+            small
+            title={c.title}
+            active={colorMode === c.id}
+            onClick={() => setColorMode(c.id)}
+          >
+            {c.label}
           </ToolbarButton>
         ))}
       </div>

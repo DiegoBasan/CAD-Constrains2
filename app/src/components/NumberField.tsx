@@ -19,6 +19,7 @@ export function NumberField({
   precision = 2,
   className,
   style,
+  disabled,
 }: {
   value: number;
   onCommit: (value: number) => void;
@@ -32,6 +33,7 @@ export function NumberField({
   precision?: number;
   className?: string;
   style?: React.CSSProperties;
+  disabled?: boolean;
 }) {
   const [text, setText] = useState(() => value.toFixed(precision));
   const focused = useRef(false);
@@ -101,8 +103,9 @@ export function NumberField({
           onCommitEnd?.();
         }
       }}
+      disabled={disabled}
       className={className}
-      style={{ ...style, cursor: "ns-resize" }}
+      style={{ ...style, cursor: disabled ? "not-allowed" : "ns-resize", opacity: disabled ? 0.5 : 1 }}
     />
   );
 }
