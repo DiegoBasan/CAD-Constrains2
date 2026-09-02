@@ -9,13 +9,18 @@ const inputStyle: React.CSSProperties = {
   color: "var(--text)",
 };
 
+// The rotation row's fields are visually distinct from the position row above them, so
+// "X°/Y°/Z°" reads unambiguously as rotation without needing the extra "R" — which
+// matters here because that one extra character was enough, at this panel's width, to
+// clip the field's own "-XX.XX" value behind its own right edge (verified: the input's
+// scrollWidth exceeded its clientWidth by ~10px for exactly the Rx/Ry/Rz fields).
 const AXES: { key: AxisKey; label: string }[] = [
   { key: "x", label: "X" },
   { key: "y", label: "Y" },
   { key: "z", label: "Z" },
-  { key: "rx", label: "Rx°" },
-  { key: "ry", label: "Ry°" },
-  { key: "rz", label: "Rz°" },
+  { key: "rx", label: "X°" },
+  { key: "ry", label: "Y°" },
+  { key: "rz", label: "Z°" },
 ];
 
 function AxisField({
@@ -45,7 +50,7 @@ function AxisField({
       >
         {locked ? "🔒" : "🔓"}
       </button>
-      <label className="flex flex-1 items-center gap-1 min-w-0">
+      <label className="flex flex-1 items-center gap-0.5 min-w-0">
         {label}
         <NumberField
           value={value}
@@ -55,7 +60,7 @@ function AxisField({
           disabled={locked}
           step={1}
           precision={2}
-          className="w-full min-w-0 rounded border px-1.5 py-0.5 text-[11px]"
+          className="w-full min-w-0 rounded border px-1 py-0.5 text-[11px]"
           style={inputStyle}
         />
       </label>
