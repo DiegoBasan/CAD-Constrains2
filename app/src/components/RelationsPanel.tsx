@@ -1,13 +1,43 @@
-import { useState } from "react";
-import { useAssemblyStore } from "../assembly/store";
-import { RELATION_ICONS, RELATION_LABELS, type Relation, type RelationType } from "../assembly/relations";
+import { useMemo, useState } from "react";
+import { useAssemblyStore, type PartState } from "../assembly/store";
+import { RELATION_ICONS, RELATION_LABELS, relationResiduals, resolveEntity, type Relation, type RelationType } from "../assembly/relations";
 import type { EntityRef } from "../occ/types";
 
 const NEEDS_VALUE: Partial<Record<RelationType, boolean>> = { distance: true, planar: true };
 
+// Above this, a relation's residual gets flagged as an active conflict rather than just
+// "not perfectly zero" — the solver's own convergence tolerance (CONVERGENCE_TOL in
+// solver.ts) is far tighter than this, but relations mix mm-scale distance residuals
+// with ~radian-scale orientation ones, so this is deliberately a loose, visual-only
+// "is something actually fighting this relation" cutoff, not a precision guarantee.
+const RESIDUAL_CONFLICT_THRESHOLD = 0.5;
+
 function entityLabel(ref: EntityRef, partName: string | undefined): string {
   if (ref.kind === "part") return partName ?? "?";
   return `${partName ?? "?"} · ${ref.kind === "face" ? "cara" : "arista"} #${ref.id}`;
+}
+
+/** How far each relation currently is from fully satisfied, recomputed straight from
+ * live poses — independent of solver.ts's own aggregate `lastSolve.residualNorm`, which
+ * only reports the total across every relation and axis lock combined, so a single
+ * relation losing a tug-of-war against a locked axis or another relation is otherwise
+ * invisible: the assembly can report "resuelto" overall while one relation is quietly
+ * not getting its way. */
+function useRelationResidualNorms(relations: Relation[], parts: Map<string, PartState>): Map<string, number> {
+  return useMemo(() => {
+    const out = new Map<string, number>();
+    for (const rel of relations) {
+      const partA = parts.get(rel.a.partId);
+      const partB = parts.get(rel.b.partId);
+      if (!partA || !partB) continue;
+      const a = resolveEntity(partA.part, rel.a, partA.pose);
+      const b = resolveEntity(partB.part, rel.b, partB.pose);
+      if (!a || !b) continue;
+      const r = relationResiduals(rel, a, b);
+      out.set(rel.id, Math.sqrt(r.reduce((s, v) => s + v * v, 0)));
+    }
+    return out;
+  }, [relations, parts]);
 }
 
 function RelationSideRow({
@@ -104,6 +134,7 @@ export function RelationsPanel() {
   const lastSolve = useAssemblyStore((s) => s.lastSolve);
 
   const [value, setValue] = useState(0);
+  const residualNorms = useRelationResidualNorms(relations, parts);
 
   const applicable = applicableRelationTypesForPicked();
 
@@ -187,12 +218,31 @@ export function RelationsPanel() {
             Aún no hay relaciones.
           </div>
         )}
-        {relations.map((rel) => (
+        {relations.map((rel) => {
+          const residual = residualNorms.get(rel.id);
+          const inConflict = residual !== undefined && residual > RESIDUAL_CONFLICT_THRESHOLD;
+          return (
           <div key={rel.id} className="flex flex-col gap-1 border-b px-3 py-2 text-[11px]" style={{ borderColor: "var(--border)" }}>
             <div className="flex items-center justify-between">
               <span className="flex items-center gap-1 font-medium" style={{ color: "var(--text-bright)" }}>
                 <span aria-hidden="true">{RELATION_ICONS[rel.type]}</span>
                 {RELATION_LABELS[rel.type]}
+                {residual !== undefined && (
+                  <span
+                    title={
+                      inConflict
+                        ? `En conflicto — no se puede satisfacer del todo (residual ${residual.toFixed(3)}), probablemente compitiendo con otra relación o un eje bloqueado`
+                        : "Satisfecha"
+                    }
+                    className="ml-1 rounded px-1 text-[10px] font-normal"
+                    style={{
+                      color: inConflict ? "var(--warn)" : "var(--ok)",
+                      background: inConflict ? "var(--accent-bg)" : "transparent",
+                    }}
+                  >
+                    {inConflict ? `⚠ ${residual.toFixed(2)}` : "✓"}
+                  </span>
+                )}
               </span>
               <button onClick={() => removeRelation(rel.id)} style={{ color: "var(--danger)" }}>
                 Eliminar
@@ -225,7 +275,8 @@ export function RelationsPanel() {
               {rel.type === "concentric" && <AngleLimitEditor rel={rel} />}
             </div>
           </div>
-        ))}
+          );
+        })}
       </div>
 
       <div
