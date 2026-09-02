@@ -1,5 +1,5 @@
 import * as THREE from "three";
-import type { ImportedPart, Pose } from "../occ/types";
+import type { AxisConstraint, ImportedPart, Pose } from "../occ/types";
 import { relationResiduals, resolveEntity, type Relation } from "./relations";
 
 export interface SolveInput {
@@ -14,6 +14,12 @@ export interface SolveInput {
    * one-shot solve (release, or the final settle) keeps the default so it can still
    * escape a genuine local minimum. */
   restarts?: number;
+  /** Per-part axis locks/limits (see PartState.axisLock/axisLimits in assembly/store.ts)
+   * — enforced here as real weighted residuals, not just a UI-drag clamp, so a locked
+   * or limited axis holds against *any* cause of movement (another relation, a rigid
+   * link, a group drag), not only the user's own direct drag on that part. Sparse: only
+   * parts that actually have a lock/limit need an entry. */
+  axisConstraints?: Map<string, AxisConstraint>;
 }
 
 export interface SolveResult {
@@ -54,6 +60,18 @@ const REG_WEIGHT = 0.02;
 // randomized free-part orientations are a cheap, standard way to escape that: each is a
 // full, cheap solve, and we keep whichever converges best.
 const RESTART_ATTEMPTS = 10;
+// Axis lock/limit weights — deliberately much stronger than REG_WEIGHT/ANGLE_LIMIT_WEIGHT
+// above, since a lock is meant to act like a near-hard constraint the rest of the
+// system must yield to (another relation or a rigid link pulling this part should lose
+// to a locked axis, not "split the difference" with it the way two ordinary relations
+// would), while a limit only needs to be assertive right at its boundary. Position
+// residuals are in mm and rotation ones in degrees, matching relation residuals'
+// existing units (see relations.ts) so they compete on comparable footing with the
+// geometric relations they're up against.
+const AXIS_LOCK_WEIGHT_POS = 20;
+const AXIS_LOCK_WEIGHT_ROT = 20;
+const AXIS_LIMIT_WEIGHT_POS = 5;
+const AXIS_LIMIT_WEIGHT_ROT = 2;
 
 function expMapDelta(rot: THREE.Vector3): THREE.Quaternion {
   const angle = rot.length();
@@ -128,10 +146,28 @@ function solveOnce(
   startPoses: Map<string, Pose>,
   freeIds: string[],
   relations: Relation[],
+  axisConstraints?: Map<string, AxisConstraint>,
 ): OnceResult {
   const n = freeIds.length * 6;
   const basePoses = new Map(startPoses);
   const x = new Float64Array(n); // [dPos(3), dRot(3)] per free part, relative to basePoses
+
+  // Rotation locks/limits compare against the Euler-XYZ decomposition of wherever this
+  // part started *this whole solve call* — dRot (an exp-map delta) has no per-Euler-axis
+  // meaning on its own, unlike dPos, whose components map 1:1 onto world X/Y/Z, so a
+  // locked position axis can just penalize its own dPos component directly.
+  const rotLockTargetDeg = new Map<string, [number, number, number]>();
+  if (axisConstraints) {
+    for (const id of freeIds) {
+      const constraint = axisConstraints.get(id);
+      const needsRot = constraint && (["rx", "ry", "rz"] as const).some((a) => constraint.lock?.[a] || constraint.limits?.[a]);
+      if (!needsRot) continue;
+      const base = startPoses.get(id);
+      if (!base) continue;
+      const e = new THREE.Euler().setFromQuaternion(new THREE.Quaternion(...base.quaternion), "XYZ");
+      rotLockTargetDeg.set(id, [THREE.MathUtils.radToDeg(e.x), THREE.MathUtils.radToDeg(e.y), THREE.MathUtils.radToDeg(e.z)]);
+    }
+  }
 
   function poseFor(partId: string, state: Float64Array): Pose {
     const base = basePoses.get(partId);
@@ -163,6 +199,62 @@ function solveOnce(
       const b = resolveEntity(partB, rel.b, poseB);
       if (!a || !b) continue;
       out.push(...relationResiduals(rel, a, b));
+    }
+    // Axis locks/limits, as real residuals competing in the same least-squares system as
+    // the relations above — see the AxisConstraint doc comment on SolveInput. Every
+    // branch below depends only on `axisConstraints` (fixed for this whole solveOnce
+    // call) and not on `state` itself, so the number of values pushed per free part is
+    // the same on every call — required for the FD Jacobian's J[i][j] indexing above.
+    if (axisConstraints) {
+      for (let idx = 0; idx < freeIds.length; idx++) {
+        const id = freeIds[idx];
+        const constraint = axisConstraints.get(id);
+        if (!constraint) continue;
+
+        const posAxes = ["x", "y", "z"] as const;
+        const needsPos = posAxes.some((a) => constraint.lock?.[a] || constraint.limits?.[a]);
+        if (needsPos) {
+          // Compare the CURRENT absolute position (via poseFor, which already folds in
+          // basePoses) against where this part started the whole solve call — never the
+          // raw `state[off+i]` delta, which resets to 0 every time a step gets accepted
+          // and basePoses re-centers onto it (see the re-centering comment below), so it
+          // only sees this iteration's step and not cumulative drift across iterations.
+          const startPos = startPoses.get(id)!.position;
+          const curPos = poseFor(id, state).position;
+          for (let i = 0; i < 3; i++) {
+            const axis = posAxes[i];
+            if (constraint.lock?.[axis]) {
+              out.push((curPos[i] - startPos[i]) * AXIS_LOCK_WEIGHT_POS);
+            } else if (constraint.limits?.[axis]) {
+              const [min, max] = constraint.limits[axis]!;
+              const over = Math.max(0, curPos[i] - max);
+              const under = Math.max(0, min - curPos[i]);
+              out.push((over - under) * AXIS_LIMIT_WEIGHT_POS);
+            }
+          }
+        }
+
+        const rotAxes = ["rx", "ry", "rz"] as const;
+        const needsRot = rotAxes.some((a) => constraint.lock?.[a] || constraint.limits?.[a]);
+        if (needsRot) {
+          const target = rotLockTargetDeg.get(id);
+          const pose = poseFor(id, state);
+          const e = new THREE.Euler().setFromQuaternion(new THREE.Quaternion(...pose.quaternion), "XYZ");
+          const curDeg = [THREE.MathUtils.radToDeg(e.x), THREE.MathUtils.radToDeg(e.y), THREE.MathUtils.radToDeg(e.z)];
+          for (let i = 0; i < 3; i++) {
+            const axis = rotAxes[i];
+            if (constraint.lock?.[axis]) {
+              const t = target ? target[i] : 0;
+              out.push((curDeg[i] - t) * AXIS_LOCK_WEIGHT_ROT);
+            } else if (constraint.limits?.[axis]) {
+              const [min, max] = constraint.limits[axis]!;
+              const over = Math.max(0, curDeg[i] - max);
+              const under = Math.max(0, min - curDeg[i]);
+              out.push((over - under) * AXIS_LIMIT_WEIGHT_ROT);
+            }
+          }
+        }
+      }
     }
     return out;
   }
@@ -281,7 +373,7 @@ function randomPerturbedPoses(base: Map<string, Pose>, freeIds: string[]): Map<s
 }
 
 export function solveAssembly(input: SolveInput): SolveResult {
-  const { parts, poses, fixedPartIds, relations } = input;
+  const { parts, poses, fixedPartIds, relations, axisConstraints } = input;
   const freeIds = Array.from(poses.keys()).filter((id) => !fixedPartIds.has(id));
 
   const outPoses = new Map(poses);
@@ -290,9 +382,9 @@ export function solveAssembly(input: SolveInput): SolveResult {
   }
 
   const restarts = input.restarts ?? RESTART_ATTEMPTS;
-  let best = solveOnce(parts, poses, freeIds, relations);
+  let best = solveOnce(parts, poses, freeIds, relations, axisConstraints);
   for (let attempt = 0; attempt < restarts && !best.converged; attempt++) {
-    const candidate = solveOnce(parts, randomPerturbedPoses(poses, freeIds), freeIds, relations);
+    const candidate = solveOnce(parts, randomPerturbedPoses(poses, freeIds), freeIds, relations, axisConstraints);
     if (candidate.residualNorm < best.residualNorm) best = candidate;
   }
   return best;

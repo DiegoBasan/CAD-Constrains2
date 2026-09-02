@@ -1,13 +1,11 @@
 import * as THREE from "three";
 import { create } from "zustand";
-import type { EntityRef, FaceInfo, EdgeInfo, ImportedAssembly, ImportedPart, Pose, Quat, Vec3 } from "../occ/types";
+import type { AxisConstraint, AxisKey, EntityRef, FaceInfo, EdgeInfo, ImportedAssembly, ImportedPart, Pose, Quat, Vec3 } from "../occ/types";
 import { countConnectedBodies, splitPartMesh } from "../occ/split";
 import { applicableRelationTypes, resolveEntity, type Relation, type RelationType } from "./relations";
 import { solveAssembly } from "./solver";
 
-/** One editable coordinate: world-frame X/Y/Z position (mm) or Rx/Ry/Rz Euler-XYZ
- * rotation (degrees) — matches exactly what InspectorPanel's six AxisFields show. */
-export type AxisKey = "x" | "y" | "z" | "rx" | "ry" | "rz";
+export type { AxisKey };
 
 export interface PartState {
   part: ImportedPart;
@@ -298,10 +296,33 @@ function propagateRigidSeed(parts: Map<string, PartState>, relations: Relation[]
       const otherEntry = parts.get(otherId);
       if (!otherEntry || otherEntry.fixed) continue;
       const predicted = predictRigidPartner(rel, isA ? "a" : "b", pose);
-      seed.set(otherId, predicted);
-      queue.push([otherId, predicted]);
+      // Re-clamp the rigid link's prediction against the partner's OWN axis locks/
+      // limits — otherwise a locked partner's *seed* (the solver's warm-start point,
+      // used as the reference every axis-lock residual holds against) would already
+      // sit at the un-clamped, rigid-predicted position by the time the solver ever
+      // runs, so the lock would end up "holding" the wrong (drifted) value instead of
+      // rejecting the drift. Matches the same clamp already applied to the directly-
+      // dragged part's own patch, just extended to whoever the rigid link propagates to.
+      const clamped = clampToAxisConstraints(otherEntry, predicted) as Pose;
+      seed.set(otherId, clamped);
+      queue.push([otherId, clamped]);
     }
   }
+}
+
+/** Sparse per-part axis locks/limits, in the shape the solver wants (see
+ * SolveInput.axisConstraints) — built fresh from live PartState on every solve call
+ * since axisLock/axisLimits can change between calls. Only parts that actually have a
+ * lock or limit get an entry, and `undefined` (not an empty Map) is returned when
+ * nothing is constrained so solveAssembly's callers can skip the extra residual work. */
+function buildAxisConstraints(parts: Map<string, PartState>): Map<string, AxisConstraint> | undefined {
+  let map: Map<string, AxisConstraint> | undefined;
+  for (const [id, st] of parts) {
+    if (!st.axisLock && !st.axisLimits) continue;
+    if (!map) map = new Map();
+    map.set(id, { lock: st.axisLock, limits: st.axisLimits });
+  }
+  return map;
 }
 
 function solveFromSeed(parts: Map<string, PartState>, relations: Relation[], seed: Map<string, Pose>) {
@@ -313,7 +334,8 @@ function solveFromSeed(parts: Map<string, PartState>, relations: Relation[], see
     poses.set(id, st.fixed ? st.pose : (seed.get(id) ?? st.pose));
     if (st.fixed) fixedIds.add(id);
   }
-  return solveAssembly({ parts: partMap, poses, fixedPartIds: fixedIds, relations, restarts: 0 });
+  const axisConstraints = buildAxisConstraints(parts);
+  return solveAssembly({ parts: partMap, poses, fixedPartIds: fixedIds, relations, restarts: 0, axisConstraints });
 }
 
 const POSITION_AXES: AxisKey[] = ["x", "y", "z"];
@@ -1065,7 +1087,8 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
       if (st.fixed) fixedIds.add(id);
     }
 
-    const result = solveAssembly({ parts: partMap, poses, fixedPartIds: fixedIds, relations });
+    const axisConstraints = buildAxisConstraints(parts);
+    const result = solveAssembly({ parts: partMap, poses, fixedPartIds: fixedIds, relations, axisConstraints });
 
     const nextParts = new Map(parts);
     for (const [id, pose] of result.poses) {

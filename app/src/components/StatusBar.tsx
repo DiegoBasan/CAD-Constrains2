@@ -11,7 +11,7 @@ export function StatusBar() {
     >
       <span>Piezas: {partCount}</span>
       <span>Relaciones: {relations}</span>
-      <span className="ml-auto">Clic en una pieza para moverla · clic en dos caras/aristas para relacionarlas</span>
+      <span className="ml-auto">Clic en una pieza para moverla · Shift+clic para seleccionar varias · Ctrl/Cmd+clic en dos caras/aristas para relacionarlas</span>
     </div>
   );
 }

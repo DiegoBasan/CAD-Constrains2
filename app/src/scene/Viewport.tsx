@@ -547,7 +547,7 @@ export function Viewport() {
       return raycaster;
     }
 
-    function pick(clientX: number, clientY: number, shiftKey: boolean) {
+    function pick(clientX: number, clientY: number, shiftKey: boolean, ctrlKey: boolean) {
       const rc = raycasterFromEvent(clientX, clientY);
       if (!rc) return;
 
@@ -556,49 +556,50 @@ export function Viewport() {
 
       const lineHits = rc.intersectObjects(visuals.map((v) => v.edgeLines), false);
       const faceHits = rc.intersectObjects(visuals.map((v) => v.mesh), false);
+      const hitPartId = (lineHits[0] ?? faceHits[0])?.object.userData.partId as string | undefined;
 
       if (shiftKey) {
         // Shift-click always selects the whole object, never a single face/edge — that's
         // the point of the distinction from a plain click, which feeds the two-pick
         // relation flow below.
-        const hit = lineHits[0] ?? faceHits[0];
-        const partId = hit ? (hit.object.userData.partId as string) : undefined;
-        if (partId) toggleMultiSelect(partId);
+        if (hitPartId) toggleMultiSelect(hitPartId);
         return;
       }
+
+      // Ctrl/Cmd-click is required to pick a specific face/edge (for building a
+      // relation) — a plain click always selects the whole object instead, which is
+      // both the safer default (no more "clicked a body and accidentally picked
+      // whatever face the raycaster happened to hit first, sometimes the back one
+      // through thin/overlapping geometry") and consistent with Ctrl-click already
+      // meaning "get specific" everywhere else (tree panel multi-select). A camera has
+      // no faces/edges to resolve a pick against, so it always falls back to
+      // whole-object selection regardless of Ctrl.
+      if (ctrlKey && hitPartId && !currentParts.get(hitPartId)?.isCamera) {
+        clearMultiSelect();
+        if (lineHits.length > 0) {
+          const hit = lineHits[0];
+          const partId = hit.object.userData.partId as string;
+          const segmentIndex = Math.floor((hit.index ?? 0) / 2);
+          const edgeIdx = visualsRef.current.get(partId)?.edgeSegmentIndex[segmentIndex];
+          const edge = edgeIdx !== undefined ? currentParts.get(partId)?.part.mesh.edges[edgeIdx] : undefined;
+          if (edge) {
+            pickEntity({ partId, kind: "edge", id: edge.id });
+            return;
+          }
+        }
+        if (faceHits.length > 0) {
+          const hit = faceHits[0];
+          const partId = hit.object.userData.partId as string;
+          const faceId = currentParts.get(partId)?.part.mesh.triangleFaceId[hit.faceIndex ?? 0];
+          if (faceId !== undefined) {
+            pickEntity({ partId, kind: "face", id: faceId });
+            return;
+          }
+        }
+      }
+
       clearMultiSelect();
-
-      // A camera object has no faces/edges to resolve a pick against — a plain click on
-      // its proxy sphere or frustum gizmo just selects the whole object, the same as a
-      // shift-click would (it just also can't participate in the two-pick relation flow).
-      const hitPartId = (lineHits[0] ?? faceHits[0])?.object.userData.partId as string | undefined;
-      if (hitPartId && currentParts.get(hitPartId)?.isCamera) {
-        selectPart(hitPartId);
-        return;
-      }
-
-      if (lineHits.length > 0) {
-        const hit = lineHits[0];
-        const partId = hit.object.userData.partId as string;
-        const segmentIndex = Math.floor((hit.index ?? 0) / 2);
-        const edgeIdx = visualsRef.current.get(partId)?.edgeSegmentIndex[segmentIndex];
-        const edge = edgeIdx !== undefined ? currentParts.get(partId)?.part.mesh.edges[edgeIdx] : undefined;
-        if (edge) {
-          pickEntity({ partId, kind: "edge", id: edge.id });
-          return;
-        }
-      }
-
-      if (faceHits.length > 0) {
-        const hit = faceHits[0];
-        const partId = hit.object.userData.partId as string;
-        const faceId = currentParts.get(partId)?.part.mesh.triangleFaceId[hit.faceIndex ?? 0];
-        if (faceId !== undefined) {
-          pickEntity({ partId, kind: "face", id: faceId });
-          return;
-        }
-      }
-      selectPart(null);
+      selectPart(hitPartId ?? null);
     }
 
     function onPointerDown(e: PointerEvent) {
@@ -820,7 +821,7 @@ export function Viewport() {
       pointerDownRef.current = null;
       if (!start) return;
       if (Math.hypot(e.clientX - start.x, e.clientY - start.y) > 4) return;
-      pick(e.clientX, e.clientY, e.shiftKey);
+      pick(e.clientX, e.clientY, e.shiftKey, e.ctrlKey || e.metaKey);
     }
 
     // WASD camera orbit — an alternative to dragging on empty space to orbit: W/S tilt

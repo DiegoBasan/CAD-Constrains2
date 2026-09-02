@@ -80,3 +80,18 @@ export interface EntityRef {
   kind: "face" | "edge" | "part";
   id: number; // FaceInfo.id or EdgeInfo.id; unused for kind "part"
 }
+
+/** One editable coordinate: world-frame X/Y/Z position (mm) or Rx/Ry/Rz Euler-XYZ
+ * rotation (degrees) — matches exactly what InspectorPanel's six AxisFields show.
+ * Lives here (not in assembly/store.ts, where it conceptually belongs) so both the
+ * store and the solver can import it without a circular dependency — the solver needs
+ * it to enforce axis locks/limits as real constraints, not just a UI-drag clamp. */
+export type AxisKey = "x" | "y" | "z" | "rx" | "ry" | "rz";
+
+/** A part's axis lock/limit state, as the solver needs it — see PartState.axisLock/
+ * axisLimits in assembly/store.ts (the source of truth); this is just the subset the
+ * solver reads, keyed by partId in SolveInput.axisConstraints. */
+export interface AxisConstraint {
+  lock?: Partial<Record<AxisKey, boolean>>;
+  limits?: Partial<Record<AxisKey, [number, number]>>;
+}

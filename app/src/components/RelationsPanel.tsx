@@ -119,14 +119,14 @@ export function RelationsPanel() {
       <div className="border-b px-3 py-3" style={{ borderColor: "var(--border)" }}>
         {editingRelationSide ? (
           <div className="mb-2 flex items-center justify-between gap-2 text-[11px]" style={{ color: "var(--warn)" }}>
-            <span>Clic en una nueva cara/arista para reemplazar el lado {editingRelationSide.side.toUpperCase()}.</span>
+            <span>Ctrl/Cmd+clic en una nueva cara/arista para reemplazar el lado {editingRelationSide.side.toUpperCase()}.</span>
             <button onClick={cancelEditRelationSide} className="underline" style={{ color: "var(--text-dim)" }}>
               Cancelar
             </button>
           </div>
         ) : (
           <div className="mb-2 text-[11px]" style={{ color: "var(--text-dim)" }}>
-            Selección {pickedEntities.length}/2 — clic en dos caras o aristas de piezas distintas.
+            Selección {pickedEntities.length}/2 — Ctrl/Cmd+clic en dos caras o aristas de piezas distintas.
           </div>
         )}
         <div className="mb-2 flex flex-col gap-1">
