@@ -155,6 +155,7 @@ interface AssemblyStore {
    * Shift-click in the viewport. */
   toggleMultiSelect: (partId: string) => void;
   clearMultiSelect: () => void;
+  selectAllParts: () => void;
   /** Bulk actions over the current multi-selection (or an explicit id list). */
   bulkSetFixed: (partIds: string[], fixed: boolean) => void;
   bulkSetColor: (partIds: string[], color: number) => void;
@@ -623,6 +624,8 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
     set({ selectedPartIds: next });
   },
   clearMultiSelect: () => set({ selectedPartIds: new Set() }),
+  selectAllParts: () =>
+    set({ selectedPartIds: new Set(get().partOrder), selectedPartId: null, selectedGroupId: null, pickedEntities: [] }),
 
   bulkSetFixed: (partIds, fixed) => {
     const ids = partIds.filter((id) => get().parts.has(id));

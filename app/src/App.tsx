@@ -34,6 +34,14 @@ export default function App() {
         return;
       }
 
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a") {
+        const store = useAssemblyStore.getState();
+        if (store.partOrder.length === 0) return;
+        e.preventDefault(); // otherwise this is the browser's "select all page text"
+        store.selectAllParts();
+        return;
+      }
+
       if (e.key === "Delete" || e.key === "Backspace") {
         const store = useAssemblyStore.getState();
         if (store.isPlaying) return;
