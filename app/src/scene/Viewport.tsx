@@ -216,7 +216,7 @@ export function Viewport() {
     if (!container) return;
 
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x0b0d12);
+    scene.background = new THREE.Color(0x151515);
     sceneRef.current = scene;
 
     const width = container.clientWidth || 1;
@@ -234,7 +234,7 @@ export function Viewport() {
     rendererRef.current = renderer;
     container.appendChild(renderer.domElement);
 
-    scene.add(new THREE.HemisphereLight(0xffffff, 0x1a1c22, 1.1));
+    scene.add(new THREE.HemisphereLight(0xffffff, 0x212121, 1.1));
     const key = new THREE.DirectionalLight(0xffffff, 1.3);
     key.position.set(1, -1, 2);
     scene.add(key);
@@ -242,7 +242,7 @@ export function Viewport() {
     fill.position.set(-1, 1, -1);
     scene.add(fill);
 
-    const grid = new THREE.GridHelper(2000, 40, 0x2a2e3a, 0x1a1c24);
+    const grid = new THREE.GridHelper(2000, 40, 0x373737, 0x212121);
     grid.rotation.x = Math.PI / 2; // lie flat on the XY plane (scene is Z-up)
     scene.add(grid);
 
@@ -444,14 +444,52 @@ export function Viewport() {
       pick(e.clientX, e.clientY);
     }
 
+    // WASD camera orbit — an alternative to dragging on empty space to orbit: W/S tilt
+    // the view toward the top/bottom, A/D swing it left/right. Applied by editing the
+    // camera's spherical position around orbit.target directly and letting the next
+    // orbit.update() pick it up (it re-derives its internal spherical state from
+    // camera.position every call, so this composes cleanly with mouse-driven orbiting).
+    const heldKeys = new Set<string>();
+    const CAMERA_KEY_SPEED = 1.4; // rad/sec
+    function isTextInput(el: EventTarget | null): boolean {
+      return el instanceof HTMLElement && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
+    }
+    function onWindowKeyDown(e: KeyboardEvent) {
+      const k = e.key.toLowerCase();
+      if (k !== "w" && k !== "a" && k !== "s" && k !== "d") return;
+      if (isTextInput(e.target)) return;
+      heldKeys.add(k);
+    }
+    function onWindowKeyUp(e: KeyboardEvent) {
+      heldKeys.delete(e.key.toLowerCase());
+    }
+    window.addEventListener("keydown", onWindowKeyDown);
+    window.addEventListener("keyup", onWindowKeyUp);
+
     let raf = 0;
-    const animate = () => {
+    let lastFrameTime = performance.now();
+    const animate = (now: number) => {
+      const dt = Math.min((now - lastFrameTime) / 1000, 0.1);
+      lastFrameTime = now;
+
+      if (heldKeys.size > 0) {
+        const offset = camera.position.clone().sub(orbit.target);
+        const spherical = new THREE.Spherical().setFromVector3(offset);
+        if (heldKeys.has("a")) spherical.theta += CAMERA_KEY_SPEED * dt;
+        if (heldKeys.has("d")) spherical.theta -= CAMERA_KEY_SPEED * dt;
+        if (heldKeys.has("w")) spherical.phi -= CAMERA_KEY_SPEED * dt;
+        if (heldKeys.has("s")) spherical.phi += CAMERA_KEY_SPEED * dt;
+        spherical.phi = THREE.MathUtils.clamp(spherical.phi, 0.01, Math.PI - 0.01);
+        offset.setFromSpherical(spherical);
+        camera.position.copy(orbit.target).add(offset);
+      }
+
       orbit.update();
       processDragFrame();
       renderer.render(scene, camera);
       raf = requestAnimationFrame(animate);
     };
-    animate();
+    raf = requestAnimationFrame(animate);
 
     const resizeObserver = new ResizeObserver(() => {
       const el = containerRef.current;
@@ -480,6 +518,8 @@ export function Viewport() {
       dom.removeEventListener("pointerdown", onPointerDown);
       dom.removeEventListener("pointermove", onPointerMove);
       dom.removeEventListener("pointerup", onPointerUp);
+      window.removeEventListener("keydown", onWindowKeyDown);
+      window.removeEventListener("keyup", onWindowKeyUp);
       orbit.dispose();
       renderer.dispose();
       container.removeChild(renderer.domElement);

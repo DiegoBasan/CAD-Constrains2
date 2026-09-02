@@ -39,6 +39,52 @@ function RelationSideRow({
   );
 }
 
+function AngleLimitEditor({ rel }: { rel: Relation }) {
+  const setRelationAngleLimits = useAssemblyStore((s) => s.setRelationAngleLimits);
+  const clearRelationAngleLimits = useAssemblyStore((s) => s.clearRelationAngleLimits);
+  const hasLimit = rel.angleMin !== undefined && rel.angleMax !== undefined;
+
+  return (
+    <div className="flex w-full flex-col gap-1.5">
+      <label className="flex items-center gap-1.5" style={{ color: "var(--text-dim)" }}>
+        <input
+          type="checkbox"
+          checked={hasLimit}
+          onChange={(e) => {
+            if (e.target.checked) setRelationAngleLimits(rel.id, -45, 45);
+            else clearRelationAngleLimits(rel.id);
+          }}
+        />
+        Limitar ángulo de giro
+      </label>
+      {hasLimit && (
+        <div className="flex items-center gap-2">
+          <label className="flex items-center gap-1.5" style={{ color: "var(--text-dim)" }}>
+            Mín°
+            <input
+              type="number"
+              value={rel.angleMin}
+              onChange={(e) => setRelationAngleLimits(rel.id, Number(e.target.value), rel.angleMax!)}
+              className="w-16 rounded border px-1 py-0.5"
+              style={{ borderColor: "var(--border-strong)", background: "var(--bg-2)", color: "var(--text)" }}
+            />
+          </label>
+          <label className="flex items-center gap-1.5" style={{ color: "var(--text-dim)" }}>
+            Máx°
+            <input
+              type="number"
+              value={rel.angleMax}
+              onChange={(e) => setRelationAngleLimits(rel.id, rel.angleMin!, Number(e.target.value))}
+              className="w-16 rounded border px-1 py-0.5"
+              style={{ borderColor: "var(--border-strong)", background: "var(--bg-2)", color: "var(--text)" }}
+            />
+          </label>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function RelationsPanel() {
   const parts = useAssemblyStore((s) => s.parts);
   const pickedEntities = useAssemblyStore((s) => s.pickedEntities);
@@ -171,6 +217,7 @@ export function RelationsPanel() {
                   />
                 </label>
               )}
+              {rel.type === "concentric" && <AngleLimitEditor rel={rel} />}
             </div>
           </div>
         ))}
