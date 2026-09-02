@@ -60,16 +60,21 @@ const REG_WEIGHT = 0.02;
 // randomized free-part orientations are a cheap, standard way to escape that: each is a
 // full, cheap solve, and we keep whichever converges best.
 const RESTART_ATTEMPTS = 10;
-// Axis lock/limit weights — deliberately much stronger than REG_WEIGHT/ANGLE_LIMIT_WEIGHT
-// above, since a lock is meant to act like a near-hard constraint the rest of the
-// system must yield to (another relation or a rigid link pulling this part should lose
-// to a locked axis, not "split the difference" with it the way two ordinary relations
-// would), while a limit only needs to be assertive right at its boundary. Position
-// residuals are in mm and rotation ones in degrees, matching relation residuals'
-// existing units (see relations.ts) so they compete on comparable footing with the
-// geometric relations they're up against.
-const AXIS_LOCK_WEIGHT_POS = 20;
-const AXIS_LOCK_WEIGHT_ROT = 20;
+// Both a locked POSITION and a locked ROTATION axis are true hard constraints now —
+// see the delta-zeroing in the trust-region-cap loop (position) and
+// applyRotationLockCorrection (rotation), both applied after every accepted step — so
+// there's no lock *weight* to tune here any more: nothing can out-pull either one,
+// however many relations compound against it or how large the mismatch. An earlier
+// version enforced rotation locks as a heavily-weighted soft residual instead (dRot is
+// an exp-map delta with no per-Euler-axis correspondence, so it looked like the only
+// option), but a large enough compounding pull — e.g. two separate rigid links both
+// landing on the same locked part — could still overwhelm any finite weight and rotate
+// it well past its lock. Only a *limit* (an elastic boundary, not a fixed value) still
+// needs a residual, for both position and rotation, comparatively gentle since it only
+// has to be assertive right at its own boundary. Position residuals are in mm and
+// rotation ones in degrees, matching relation residuals' existing units (see
+// relations.ts) so they compete on comparable footing with the geometric relations
+// they're up against.
 const AXIS_LIMIT_WEIGHT_POS = 5;
 const AXIS_LIMIT_WEIGHT_ROT = 2;
 
@@ -78,6 +83,23 @@ function expMapDelta(rot: THREE.Vector3): THREE.Quaternion {
   if (angle < 1e-9) return new THREE.Quaternion(0, 0, 0, 1);
   const axis = rot.clone().multiplyScalar(1 / angle);
   return new THREE.Quaternion().setFromAxisAngle(axis, angle);
+}
+
+/** Hard-enforces a part's locked rotation axes by decomposing its solved quaternion to
+ * Euler-XYZ, snapping any locked component back to `target` (captured once, from this
+ * part's pose when the whole solve began), and rebuilding the quaternion — called on
+ * every accepted step so the next iteration's linearization already sees the locked
+ * axes exactly where they belong, the same way a locked position axis is enforced by
+ * zeroing its Newton-step delta. Position passes through untouched. */
+function applyRotationLockCorrection(pose: Pose, constraint: AxisConstraint | undefined, target: [number, number, number] | undefined): Pose {
+  if (!constraint?.lock || !target) return pose;
+  if (!constraint.lock.rx && !constraint.lock.ry && !constraint.lock.rz) return pose;
+  const e = new THREE.Euler().setFromQuaternion(new THREE.Quaternion(...pose.quaternion), "XYZ");
+  if (constraint.lock.rx) e.x = THREE.MathUtils.degToRad(target[0]);
+  if (constraint.lock.ry) e.y = THREE.MathUtils.degToRad(target[1]);
+  if (constraint.lock.rz) e.z = THREE.MathUtils.degToRad(target[2]);
+  const corrected = new THREE.Quaternion().setFromEuler(e);
+  return { position: pose.position, quaternion: [corrected.x, corrected.y, corrected.z, corrected.w] };
 }
 
 /** Solves a Gaussian-eliminated dense linear system (A + lambda*diag(A)) x = b in place. Returns null if singular. */
@@ -211,47 +233,49 @@ function solveOnce(
         const constraint = axisConstraints.get(id);
         if (!constraint) continue;
 
+        // A locked position axis is enforced as a real hard constraint (see the
+        // delta-zeroing in the Newton step loop below) rather than through a residual
+        // here — unlike the earlier weighted-penalty version, this guarantees exact
+        // zero drift regardless of how hard other relations pull on it, and avoids
+        // adding a large-weight residual that would otherwise stiffen (and can
+        // ill-condition) the normal equations for every OTHER free part touching this
+        // one through a relation. Only limits — which are an elastic boundary, not a
+        // fixed value — still need a soft residual.
         const posAxes = ["x", "y", "z"] as const;
-        const needsPos = posAxes.some((a) => constraint.lock?.[a] || constraint.limits?.[a]);
-        if (needsPos) {
-          // Compare the CURRENT absolute position (via poseFor, which already folds in
-          // basePoses) against where this part started the whole solve call — never the
-          // raw `state[off+i]` delta, which resets to 0 every time a step gets accepted
-          // and basePoses re-centers onto it (see the re-centering comment below), so it
-          // only sees this iteration's step and not cumulative drift across iterations.
-          const startPos = startPoses.get(id)!.position;
+        const needsPosLimit = posAxes.some((a) => !constraint.lock?.[a] && constraint.limits?.[a]);
+        if (needsPosLimit) {
           const curPos = poseFor(id, state).position;
           for (let i = 0; i < 3; i++) {
             const axis = posAxes[i];
-            if (constraint.lock?.[axis]) {
-              out.push((curPos[i] - startPos[i]) * AXIS_LOCK_WEIGHT_POS);
-            } else if (constraint.limits?.[axis]) {
-              const [min, max] = constraint.limits[axis]!;
-              const over = Math.max(0, curPos[i] - max);
-              const under = Math.max(0, min - curPos[i]);
-              out.push((over - under) * AXIS_LIMIT_WEIGHT_POS);
-            }
+            if (constraint.lock?.[axis]) continue;
+            const range = constraint.limits?.[axis];
+            if (!range) continue;
+            const [min, max] = range;
+            const over = Math.max(0, curPos[i] - max);
+            const under = Math.max(0, min - curPos[i]);
+            out.push((over - under) * AXIS_LIMIT_WEIGHT_POS);
           }
         }
 
+        // A locked rotation axis is also a hard constraint now — see
+        // applyRotationLockCorrection below, called after every accepted step — so like
+        // position, only a *limit* (an elastic boundary, not a fixed value) still needs
+        // a residual here.
         const rotAxes = ["rx", "ry", "rz"] as const;
-        const needsRot = rotAxes.some((a) => constraint.lock?.[a] || constraint.limits?.[a]);
-        if (needsRot) {
-          const target = rotLockTargetDeg.get(id);
+        const needsRotLimit = rotAxes.some((a) => !constraint.lock?.[a] && constraint.limits?.[a]);
+        if (needsRotLimit) {
           const pose = poseFor(id, state);
           const e = new THREE.Euler().setFromQuaternion(new THREE.Quaternion(...pose.quaternion), "XYZ");
           const curDeg = [THREE.MathUtils.radToDeg(e.x), THREE.MathUtils.radToDeg(e.y), THREE.MathUtils.radToDeg(e.z)];
           for (let i = 0; i < 3; i++) {
             const axis = rotAxes[i];
-            if (constraint.lock?.[axis]) {
-              const t = target ? target[i] : 0;
-              out.push((curDeg[i] - t) * AXIS_LOCK_WEIGHT_ROT);
-            } else if (constraint.limits?.[axis]) {
-              const [min, max] = constraint.limits[axis]!;
-              const over = Math.max(0, curDeg[i] - max);
-              const under = Math.max(0, min - curDeg[i]);
-              out.push((over - under) * AXIS_LIMIT_WEIGHT_ROT);
-            }
+            if (constraint.lock?.[axis]) continue;
+            const range = constraint.limits?.[axis];
+            if (!range) continue;
+            const [min, max] = range;
+            const over = Math.max(0, curDeg[i] - max);
+            const under = Math.max(0, min - curDeg[i]);
+            out.push((over - under) * AXIS_LIMIT_WEIGHT_ROT);
           }
         }
       }
@@ -327,6 +351,18 @@ function solveOnce(
           delta[off + 4] *= s;
           delta[off + 5] *= s;
         }
+
+        // Hard-lock a position axis: force its share of this step to exactly zero,
+        // every iteration — since dPos maps 1:1 onto world X/Y/Z, this is an exact,
+        // unambiguous constraint (unlike rotation, whose exp-map delta has no
+        // per-Euler-axis correspondence to hold one axis hard the same way). Combined
+        // with basePoses re-centering onto xTry after each accepted step, the locked
+        // component of basePoses — and so this part's final position on that axis —
+        // never moves from where it was when this whole solve began.
+        const lock = axisConstraints?.get(freeIds[idx])?.lock;
+        if (lock?.x) delta[off] = 0;
+        if (lock?.y) delta[off + 1] = 0;
+        if (lock?.z) delta[off + 2] = 0;
       }
       const xTry = Float64Array.from(x);
       for (let i = 0; i < n; i++) xTry[i] += delta[i];
@@ -339,10 +375,18 @@ function solveOnce(
         // early step, right where the axis-angle exp map's differential degenerates
         // (sin(angle/2) -> 0) — the FD Jacobian goes to noise there and Gauss-Newton
         // can never recover. Re-centering keeps every local linearization in the exp
-        // map's well-conditioned near-origin region.
-        for (const id of freeIds) basePoses.set(id, poseFor(id, xTry));
+        // map's well-conditioned near-origin region. Also where a locked rotation axis
+        // gets snapped back exactly (applyRotationLockCorrection) — since that can
+        // change the pose from what `rTry` was measured against, re-evaluate the
+        // residual against the now-corrected basePoses (x is freshly zero, so
+        // poseFor returns basePoses directly) rather than reusing the stale rTry.
+        for (const id of freeIds) {
+          const pose = poseFor(id, xTry);
+          const corrected = applyRotationLockCorrection(pose, axisConstraints?.get(id), rotLockTargetDeg.get(id));
+          basePoses.set(id, corrected);
+        }
         x.fill(0);
-        r = rTry;
+        r = residuals(x);
         lambda = Math.max(lambda * 0.5, 1e-8);
         accepted = true;
       } else {
@@ -358,11 +402,21 @@ function solveOnce(
   return { poses: outPoses, residualNorm: finalNorm, iterations, converged };
 }
 
-function randomPerturbedPoses(base: Map<string, Pose>, freeIds: string[]): Map<string, Pose> {
+function randomPerturbedPoses(base: Map<string, Pose>, freeIds: string[], axisConstraints?: Map<string, AxisConstraint>): Map<string, Pose> {
   const out = new Map(base);
   for (const id of freeIds) {
     const pose = base.get(id);
     if (!pose) continue;
+    // Never jitter the rotation of a part with any locked rotation axis — solveOnce
+    // reads its lock *target* from wherever this pose's Euler-XYZ decomposition already
+    // is when it starts (see rotLockTargetDeg), so randomizing it here wouldn't just
+    // give this restart a worse starting guess, it would silently move what "locked"
+    // means for the entire restart to whatever the random jitter happened to land on.
+    const lock = axisConstraints?.get(id)?.lock;
+    if (lock?.rx || lock?.ry || lock?.rz) {
+      out.set(id, { position: [...pose.position], quaternion: [...pose.quaternion] });
+      continue;
+    }
     const axis = new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).normalize();
     const angle = Math.random() * Math.PI * 2;
     const jitter = new THREE.Quaternion().setFromAxisAngle(axis, angle);
@@ -397,7 +451,7 @@ export function solveAssembly(input: SolveInput): SolveResult {
   const restarts = input.restarts ?? RESTART_ATTEMPTS;
   let best = solveOnce(parts, poses, freeIds, relations, axisConstraints);
   for (let attempt = 0; attempt < restarts && !best.converged; attempt++) {
-    const candidate = solveOnce(parts, randomPerturbedPoses(poses, freeIds), freeIds, relations, axisConstraints);
+    const candidate = solveOnce(parts, randomPerturbedPoses(poses, freeIds, axisConstraints), freeIds, relations, axisConstraints);
     if (candidate.residualNorm < best.residualNorm) best = candidate;
   }
   return best;

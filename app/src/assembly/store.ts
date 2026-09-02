@@ -397,6 +397,26 @@ function applyPosesToParts(parts: Map<string, PartState>, poses: Map<string, Pos
   return next;
 }
 
+const ROTATION_AXIS_KEYS = ["rx", "ry", "rz"] as const;
+
+/** A locked rotation axis can't be made a true hard constraint the way position locks
+ * are (see solver.ts's AXIS_LOCK_WEIGHT_ROT comment) — it's a heavily-weighted soft
+ * residual instead, which means the plain warm-started Gauss-Newton solve every
+ * interactive drag frame uses (restarts: 0, for speed) can get stuck fighting it rather
+ * than finding the escape a full solve's randomized restarts would (e.g. rotating the
+ * rigidly-linked assembly to satisfy a relation without violating the lock, instead of
+ * translating into it) — reported as "a veces no puedo mover cosas" when a rotation
+ * lock and a relation are both pulling on the same part. A couple of restarts only when
+ * a rotation lock is actually present keeps every other interactive drag at its usual
+ * zero-restart speed. */
+function hasRotationLock(axisConstraints: Map<string, AxisConstraint> | undefined): boolean {
+  if (!axisConstraints) return false;
+  for (const constraint of axisConstraints.values()) {
+    if (ROTATION_AXIS_KEYS.some((a) => constraint.lock?.[a])) return true;
+  }
+  return false;
+}
+
 function solveFromSeed(parts: Map<string, PartState>, relations: Relation[], seed: Map<string, Pose>) {
   const partMap = new Map<string, ImportedPart>();
   const poses = new Map<string, Pose>();
@@ -407,7 +427,8 @@ function solveFromSeed(parts: Map<string, PartState>, relations: Relation[], see
     if (st.fixed) fixedIds.add(id);
   }
   const axisConstraints = buildAxisConstraints(parts);
-  return solveAssembly({ parts: partMap, poses, fixedPartIds: fixedIds, relations, restarts: 0, axisConstraints });
+  const restarts = hasRotationLock(axisConstraints) ? 2 : 0;
+  return solveAssembly({ parts: partMap, poses, fixedPartIds: fixedIds, relations, restarts, axisConstraints });
 }
 
 const POSITION_AXES: AxisKey[] = ["x", "y", "z"];
