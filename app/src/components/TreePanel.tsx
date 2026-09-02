@@ -9,6 +9,30 @@ function numberToHex(color: number): string {
   return `#${color.toString(16).padStart(6, "0")}`;
 }
 
+const AXIS_ORDER: { key: "x" | "y" | "z" | "rx" | "ry" | "rz"; label: string }[] = [
+  { key: "x", label: "X" },
+  { key: "y", label: "Y" },
+  { key: "z", label: "Z" },
+  { key: "rx", label: "Rx" },
+  { key: "ry", label: "Ry" },
+  { key: "rz", label: "Rz" },
+];
+
+/** A part's axis lock/limit state isn't visible anywhere in the tree list — only the
+ * InspectorPanel shows it, and only for whichever single part is currently selected —
+ * so there's no way to tell at a glance which parts in a big assembly have a
+ * lock/limit that could be fighting a relation. Returns null when the part has neither,
+ * so PartRow can skip the badge entirely for the common case. */
+function axisConstraintSummary(state: PartState): string | null {
+  const locked = AXIS_ORDER.filter((a) => state.axisLock?.[a.key]).map((a) => a.label);
+  const limited = AXIS_ORDER.filter((a) => state.axisLimits?.[a.key] && !state.axisLock?.[a.key]).map((a) => a.label);
+  if (locked.length === 0 && limited.length === 0) return null;
+  const parts: string[] = [];
+  if (locked.length > 0) parts.push(`bloqueado: ${locked.join(", ")}`);
+  if (limited.length > 0) parts.push(`limitado: ${limited.join(", ")}`);
+  return parts.join(" · ");
+}
+
 export function TreePanel() {
   const partOrder = useAssemblyStore((s) => s.partOrder);
   const parts = useAssemblyStore((s) => s.parts);
@@ -289,6 +313,7 @@ const PartRow = memo(function PartRow({
 }) {
   if (!state) return null;
   const color = numberToHex(state.color ?? partColor(index));
+  const axisSummary = axisConstraintSummary(state);
   return (
     <div
       onClick={(e) => onClick(e, id)}
@@ -307,6 +332,11 @@ const PartRow = memo(function PartRow({
         <span className="h-2.5 w-2.5 shrink-0 rounded-sm" style={{ background: color }} />
       )}
       <span className="flex-1 truncate">{state.part.name}</span>
+      {axisSummary && (
+        <span title={`Ejes con restricción propia — ${axisSummary}`} className="shrink-0 text-[11px]" style={{ color: "var(--warn)" }}>
+          📐
+        </span>
+      )}
       {state.canSplit && (
         <button
           title="Esta pieza tiene varios cuerpos desconectados — separar en piezas independientes"
