@@ -23,6 +23,16 @@ class UnionFind {
 
 const WELD_EPSILON = 1e-4; // mm — merges the duplicate vertices that adjacent faces leave at shared edges
 
+interface Connectivity {
+  /** One inner array of triangle indices per connected body. */
+  groups: number[][];
+  /** Looks up which `groups` index (if any) a world-space point falls on, by matching
+   * it against the same weld grid used to connect triangles — used to assign edges
+   * (which aren't triangles, so have no index of their own) to the right body by
+   * actual geometric connectivity instead of "nearest bounding box". */
+  groupOfPoint: (p: Vec3) => number | undefined;
+}
+
 /** Groups the mesh's triangles into connected components (vertices shared between
  * triangles link them into the same body). STEP files translate each disjoint solid
  * of a multi-body part into geometry that shares no vertices with the others, so this
@@ -34,17 +44,18 @@ const WELD_EPSILON = 1e-4; // mm — merges the duplicate vertices that adjacent
  * they just have coincident *positions* there. We weld same-position vertices
  * together first so connectivity is judged on the real geometry, not on the mesh's
  * per-face vertex layout. */
-function connectedTriangleGroups(mesh: PartMesh): number[][] {
+function connectedTriangleGroups(mesh: PartMesh): Connectivity {
   const vertexCount = mesh.positions.length / 3;
   const uf = new UnionFind(vertexCount);
 
   const grid = new Map<string, number>();
   const cell = (v: number) => Math.round(v / WELD_EPSILON);
+  const keyOf = (x: number, y: number, z: number) => `${cell(x)},${cell(y)},${cell(z)}`;
   for (let i = 0; i < vertexCount; i++) {
     const x = mesh.positions[i * 3];
     const y = mesh.positions[i * 3 + 1];
     const z = mesh.positions[i * 3 + 2];
-    const key = `${cell(x)},${cell(y)},${cell(z)}`;
+    const key = keyOf(x, y, z);
     const existing = grid.get(key);
     if (existing === undefined) grid.set(key, i);
     else uf.union(existing, i);
@@ -58,22 +69,32 @@ function connectedTriangleGroups(mesh: PartMesh): number[][] {
     uf.union(a, b);
     uf.union(b, c);
   }
-  const groups = new Map<number, number[]>();
+  const groupsByRoot = new Map<number, number[]>();
   for (let t = 0; t < triCount; t++) {
     const root = uf.find(mesh.indices[t * 3]);
-    let list = groups.get(root);
+    let list = groupsByRoot.get(root);
     if (!list) {
       list = [];
-      groups.set(root, list);
+      groupsByRoot.set(root, list);
     }
     list.push(t);
   }
-  return Array.from(groups.values());
+  const roots = Array.from(groupsByRoot.keys());
+  const rootToGroupIndex = new Map<number, number>(roots.map((root, i) => [root, i]));
+  const groups = roots.map((root) => groupsByRoot.get(root)!);
+
+  const groupOfPoint = (p: Vec3): number | undefined => {
+    const vertex = grid.get(keyOf(p[0], p[1], p[2]));
+    if (vertex === undefined) return undefined;
+    return rootToGroupIndex.get(uf.find(vertex));
+  };
+
+  return { groups, groupOfPoint };
 }
 
 export function countConnectedBodies(mesh: PartMesh): number {
   if (mesh.indices.length === 0) return 1;
-  return connectedTriangleGroups(mesh).length;
+  return connectedTriangleGroups(mesh).groups.length;
 }
 
 function boxOf(positions: Float32Array, indices: Uint32Array, triIndices: number[]): { min: Vec3; max: Vec3 } {
@@ -106,7 +127,7 @@ function distanceToBox(p: Vec3, box: { min: Vec3; max: Vec3 }): number {
  * re-centered around its own bounding-box middle. Returns null if the mesh is a
  * single connected body (nothing to split). */
 export function splitPartMesh(mesh: PartMesh): { mesh: PartMesh; origin: Vec3 }[] | null {
-  const groups = connectedTriangleGroups(mesh);
+  const { groups, groupOfPoint } = connectedTriangleGroups(mesh);
   if (groups.length <= 1) return null;
 
   const boxes = groups.map((tris) => boxOf(mesh.positions, mesh.indices, tris));
@@ -147,9 +168,19 @@ export function splitPartMesh(mesh: PartMesh): { mesh: PartMesh; origin: Vec3 }[
     };
   });
 
-  // Assign each edge to whichever body's box contains (or is nearest) its midpoint —
-  // edges aren't tessellated triangles, so they need a geometric assignment instead.
+  // Assign each edge to the body it's actually welded to (via its endpoints, which
+  // coincide with real tessellated vertices at the same weld grid used to connect
+  // triangles) — not just whichever body's box happens to be nearest its midpoint,
+  // which can pick the wrong neighboring body when two bodies sit close together and
+  // produces edges that visually "belong" to the wrong part after splitting. Falls
+  // back to nearest-box only for the rare edge whose endpoints don't land on the grid
+  // (e.g. a bare vertex with no adjacent triangle in the tessellation).
   for (const edge of mesh.edges) {
+    const bodyIndex = groupOfPoint(edge.a) ?? groupOfPoint(edge.b) ?? groupOfPoint(edge.point);
+    if (bodyIndex !== undefined) {
+      subMeshes[bodyIndex].edges.push(edge);
+      continue;
+    }
     let bestIndex = 0;
     let bestDist = Infinity;
     for (let i = 0; i < boxes.length; i++) {
