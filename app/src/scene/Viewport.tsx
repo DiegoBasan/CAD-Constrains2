@@ -19,9 +19,10 @@ interface PartVisual {
  * axis-constrained) translate in the camera's view plane, or one of three rotate
  * pivots (see RotatePivotMode). Armed on pointerdown over the part; only becomes an
  * actual drag once the pointer moves past the click threshold, so a plain tap still
- * falls through to face/edge picking. Every frame's target is fed to the solver as a
- * soft goal alongside the real relations (store.applyDragPreview), so the part tracks
- * the cursor in real time within whatever freedom the relations leave it. */
+ * falls through to face/edge picking. Every frame's target seeds the solver's starting
+ * guess for the dragged part (store.applyDragPreview) instead of its last-solved pose,
+ * so the part tracks the cursor exactly where relations leave it free, and is pulled
+ * back only along whatever they actually constrain — in real time, not just on release. */
 type ArmedDrag =
   | { kind: "translate"; partId: string; dragging: boolean; plane: THREE.Plane; startPoint: THREE.Vector3; startPosition: THREE.Vector3 }
   | { kind: "rotate"; partId: string; dragging: boolean; pivotMode: RotatePivotMode; lastScreen: THREE.Vector2 };
@@ -396,7 +397,7 @@ export function Viewport() {
         const hit = new THREE.Vector3();
         if (!rc.ray.intersectPlane(armed.plane, hit)) return;
         const target = armed.startPosition.clone().add(hit.sub(armed.startPoint));
-        store.applyDragPreview({ partId: armed.partId, targetPosition: [target.x, target.y, target.z] });
+        store.applyDragPreview(armed.partId, { position: [target.x, target.y, target.z] });
         return;
       }
 
@@ -418,10 +419,9 @@ export function Viewport() {
       }
       armed.lastScreen = mouseScreen;
       if (!targetQuaternion) return;
-      store.applyDragPreview({
-        partId: armed.partId,
-        targetPosition: targetPosition ? [targetPosition.x, targetPosition.y, targetPosition.z] : undefined,
-        targetQuaternion: [targetQuaternion.x, targetQuaternion.y, targetQuaternion.z, targetQuaternion.w],
+      store.applyDragPreview(armed.partId, {
+        position: targetPosition ? [targetPosition.x, targetPosition.y, targetPosition.z] : undefined,
+        quaternion: [targetQuaternion.x, targetQuaternion.y, targetQuaternion.z, targetQuaternion.w],
       });
     }
 

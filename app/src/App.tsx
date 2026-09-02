@@ -3,6 +3,7 @@ import { Toolbar } from "./components/Toolbar";
 import { TreePanel } from "./components/TreePanel";
 import { InspectorPanel } from "./components/InspectorPanel";
 import { RelationsPanel } from "./components/RelationsPanel";
+import { KeyframesPanel } from "./components/KeyframesPanel";
 import { StatusBar } from "./components/StatusBar";
 import { Viewport } from "./scene/Viewport";
 import { useAssemblyStore } from "./assembly/store";
@@ -44,6 +45,7 @@ export default function App() {
           <div className="min-h-0 flex-1">
             <RelationsPanel />
           </div>
+          <KeyframesPanel />
         </aside>
       </div>
       <StatusBar />
