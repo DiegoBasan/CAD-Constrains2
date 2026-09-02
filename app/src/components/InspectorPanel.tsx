@@ -178,12 +178,12 @@ export function InspectorPanel() {
       {state.isCamera && (
         <label className="mb-2 flex items-center gap-2 text-[11px]" style={{ color: "var(--text-dim)" }}>
           Campo de visión (FOV)
-          <input
-            type="number"
-            min={1}
-            max={170}
+          <NumberField
             value={Math.round(state.cameraFov ?? 50)}
-            onChange={(e) => setCameraFov(selectedPartId!, Number(e.target.value))}
+            onCommit={(v) => setCameraFov(selectedPartId!, v)}
+            onCommitStart={pushHistorySnapshot}
+            step={1}
+            precision={0}
             className="w-16 rounded border px-1.5 py-0.5"
             style={inputStyle}
           />

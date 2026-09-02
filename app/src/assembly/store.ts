@@ -67,6 +67,14 @@ interface HistorySnapshot {
   partOrder: string[];
   relations: Relation[];
   groups: Group[];
+  /** Missing from this snapshot until now meant undo/redo silently did nothing for any
+   * keyframe change — every keyframe action (saveKeyframe, deleteKeyframe,
+   * renameKeyframe, overwriteKeyframe) already called pushHistorySnapshot(), but since
+   * the snapshot itself never captured or restored `keyframes`, undo just popped
+   * whatever *other* field happened to have changed most recently (or nothing at all,
+   * silently swallowing the keyframe edit) instead of undoing the keyframe action the
+   * user actually just did. */
+  keyframes: Keyframe[];
 }
 
 const MAX_HISTORY = 50;
@@ -745,6 +753,7 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
   },
 
   renameGroup: (groupId, name) => {
+    get().pushHistorySnapshot();
     set({ groups: get().groups.map((g) => (g.id === groupId ? { ...g, name: name.trim() || g.name } : g)) });
   },
 
@@ -1148,6 +1157,7 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
   },
 
   renameKeyframe: (id, name) => {
+    get().pushHistorySnapshot();
     set({ keyframes: get().keyframes.map((k) => (k.id === id ? { ...k, name: name.trim() || k.name } : k)) });
   },
 
@@ -1169,6 +1179,7 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
   overwriteKeyframe: (id) => {
     const { parts, keyframes } = get();
     if (parts.size === 0) return;
+    get().pushHistorySnapshot();
     const poses = new Map<string, Pose>();
     for (const [pid, st] of parts) poses.set(pid, st.pose);
     set({ keyframes: keyframes.map((k) => (k.id === id ? { ...k, poses } : k)) });
@@ -1233,13 +1244,13 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
   },
 
   pushHistorySnapshot: () => {
-    const { parts, partOrder, relations, groups, history } = get();
+    const { parts, partOrder, relations, groups, keyframes, history } = get();
     const trimmed = history.length >= MAX_HISTORY ? history.slice(history.length - MAX_HISTORY + 1) : history;
-    set({ history: [...trimmed, { parts, partOrder, relations, groups }], future: [] });
+    set({ history: [...trimmed, { parts, partOrder, relations, groups, keyframes }], future: [] });
   },
 
   undo: () => {
-    const { history, future, parts, partOrder, relations, groups } = get();
+    const { history, future, parts, partOrder, relations, groups, keyframes } = get();
     const previous = history[history.length - 1];
     if (!previous) return;
     set({
@@ -1247,8 +1258,9 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
       partOrder: previous.partOrder,
       relations: previous.relations,
       groups: previous.groups,
+      keyframes: previous.keyframes,
       history: history.slice(0, -1),
-      future: [...future, { parts, partOrder, relations, groups }],
+      future: [...future, { parts, partOrder, relations, groups, keyframes }],
       selectedPartId: null,
       selectedGroupId: null,
       pickedEntities: [],
@@ -1257,7 +1269,7 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
   },
 
   redo: () => {
-    const { history, future, parts, partOrder, relations, groups } = get();
+    const { history, future, parts, partOrder, relations, groups, keyframes } = get();
     const next = future[future.length - 1];
     if (!next) return;
     set({
@@ -1265,8 +1277,9 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
       partOrder: next.partOrder,
       relations: next.relations,
       groups: next.groups,
+      keyframes: next.keyframes,
       future: future.slice(0, -1),
-      history: [...history, { parts, partOrder, relations, groups }],
+      history: [...history, { parts, partOrder, relations, groups, keyframes }],
       selectedPartId: null,
       selectedGroupId: null,
       pickedEntities: [],
