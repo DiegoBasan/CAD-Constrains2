@@ -160,7 +160,12 @@ type ArmedDrag =
   // store.applyGroupDragPreview) — every member is offset by the same rigid delta from
   // its own start position, and each one still resists independently wherever its own
   // relations constrain it.
-  | { kind: "translateGroup"; dragging: boolean; plane: THREE.Plane; startPoint: THREE.Vector3; startPositions: Map<string, THREE.Vector3>; snapAxis: SnapAxis };
+  | { kind: "translateGroup"; dragging: boolean; plane: THREE.Plane; startPoint: THREE.Vector3; startPositions: Map<string, THREE.Vector3>; snapAxis: SnapAxis }
+  // Alt+drag on the canvas: a screen-space rectangle (Windows-Explorer-style) — every
+  // part whose mesh projects at least partially inside it gets multi-selected on
+  // release. `dragging` here means "past the click threshold," same as the other kinds
+  // (so a plain Alt+click without moving still falls through to a normal pick/orbit).
+  | { kind: "marquee"; dragging: boolean; startScreen: { x: number; y: number } };
 
 /** Applies (or clears) Shift-held axis-snap to a raw drag delta — see `SnapAxis`. Reads
  * and writes `armed.snapAxis` in place (picking a new axis on Shift's rising edge,
@@ -378,6 +383,7 @@ export function Viewport() {
   const setFovRef = useRef<((fov: number) => void) | null>(null);
   const applyPresetRef = useRef<((preset: ViewPreset) => void) | null>(null);
   const frameContentRef = useRef<((center: THREE.Vector3, radius: number, aspect: number) => void) | null>(null);
+  const marqueeRef = useRef<HTMLDivElement | null>(null);
 
   const parts = useAssemblyStore((s) => s.parts);
   const partOrder = useAssemblyStore((s) => s.partOrder);
@@ -575,6 +581,69 @@ export function Viewport() {
       return raycaster;
     }
 
+    // Screen-space rectangle (in the container's own local coordinates, matching the
+    // marquee overlay div's positioning) between two client-coordinate corners.
+    function marqueeScreenRect(a: { x: number; y: number }, b: { x: number; y: number }) {
+      const el = containerRef.current;
+      const rect = el?.getBoundingClientRect();
+      const originX = rect?.left ?? 0;
+      const originY = rect?.top ?? 0;
+      const x0 = Math.min(a.x, b.x) - originX;
+      const y0 = Math.min(a.y, b.y) - originY;
+      const x1 = Math.max(a.x, b.x) - originX;
+      const y1 = Math.max(a.y, b.y) - originY;
+      return { x0, y0, x1, y1 };
+    }
+
+    function updateMarqueeRect(a: { x: number; y: number }, b: { x: number; y: number }) {
+      const el = marqueeRef.current;
+      if (!el) return;
+      const { x0, y0, x1, y1 } = marqueeScreenRect(a, b);
+      el.hidden = false;
+      el.style.left = `${x0}px`;
+      el.style.top = `${y0}px`;
+      el.style.width = `${x1 - x0}px`;
+      el.style.height = `${y1 - y0}px`;
+    }
+
+    function hideMarqueeRect() {
+      const el = marqueeRef.current;
+      if (el) el.hidden = true;
+    }
+
+    // Projects a visual's world-space bounding box corners to screen space and returns
+    // their 2D bounding rectangle — an approximation (the object's actual silhouette
+    // can be smaller than its box, e.g. near a corner), but the same practical
+    // trade-off every marquee-select tool makes, and cheap enough to run for every part
+    // on every marquee drag frame.
+    function projectedScreenBox(visual: PartVisual): { x0: number; y0: number; x1: number; y1: number } | null {
+      const geometry = visual.mesh.geometry;
+      if (!geometry.boundingBox) geometry.computeBoundingBox();
+      const box = geometry.boundingBox;
+      if (!box || box.isEmpty()) return null;
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      const corner = new THREE.Vector3();
+      for (let i = 0; i < 8; i++) {
+        corner.set(i & 1 ? box.max.x : box.min.x, i & 2 ? box.max.y : box.min.y, i & 4 ? box.max.z : box.min.z);
+        corner.applyMatrix4(visual.group.matrixWorld).project(camera);
+        // NDC (-1..1) -> local container pixel coordinates.
+        const el = containerRef.current;
+        const w = el?.clientWidth ?? 1;
+        const h = el?.clientHeight ?? 1;
+        const sx = ((corner.x + 1) / 2) * w;
+        const sy = ((1 - corner.y) / 2) * h;
+        minX = Math.min(minX, sx);
+        maxX = Math.max(maxX, sx);
+        minY = Math.min(minY, sy);
+        maxY = Math.max(maxY, sy);
+      }
+      return { x0: minX, y0: minY, x1: maxX, y1: maxY };
+    }
+
+    function rectsOverlap(a: { x0: number; y0: number; x1: number; y1: number }, b: { x0: number; y0: number; x1: number; y1: number }): boolean {
+      return a.x0 <= b.x1 && a.x1 >= b.x0 && a.y0 <= b.y1 && a.y1 >= b.y0;
+    }
+
     // Resolves exactly which face or edge is under the cursor, the same way a
     // Ctrl/Cmd-click pick does — shared between the actual pick (below) and the hover
     // preview, so "what you're about to pick" and "what you actually get" can never
@@ -655,6 +724,15 @@ export function Viewport() {
       pointerDownRef.current = { x: e.clientX, y: e.clientY };
       latestPointerRef.current = { x: e.clientX, y: e.clientY, shiftKey: e.shiftKey };
       armedDragRef.current = null;
+
+      // Alt always means "start a marquee selection," regardless of what's under the
+      // cursor — takes priority over every other drag/pick gesture below, the same way
+      // Windows Explorer's rubber-band select works.
+      if (e.altKey) {
+        orbit.enabled = false;
+        armedDragRef.current = { kind: "marquee", dragging: false, startScreen: { x: e.clientX, y: e.clientY } };
+        return;
+      }
 
       const {
         selectedPartId: selId,
@@ -804,9 +882,12 @@ export function Viewport() {
         const start = pointerDownRef.current;
         if (!start || Math.hypot(e.clientX - start.x, e.clientY - start.y) <= 4) return;
         armed.dragging = true;
-        useAssemblyStore.getState().pushHistorySnapshot();
-        dom.style.cursor = "grabbing";
+        // A marquee only ever changes selection, never assembly data — pushing a
+        // history snapshot for it would waste an undo-stack slot on a no-op restore.
+        if (armed.kind !== "marquee") useAssemblyStore.getState().pushHistorySnapshot();
+        dom.style.cursor = armed.kind === "marquee" ? "" : "grabbing";
       }
+      if (armed.kind === "marquee" && armed.dragging) updateMarqueeRect(armed.startScreen, { x: e.clientX, y: e.clientY });
     }
 
     // The actual per-frame drag solve is throttled to the render loop (below) rather
@@ -817,6 +898,9 @@ export function Viewport() {
       const armed = armedDragRef.current;
       const pointer = latestPointerRef.current;
       if (!armed || !armed.dragging || !pointer) return;
+      // The marquee rectangle is drawn straight from pointermove (updateMarqueeRect),
+      // not through this throttled solve-per-frame path — it never touches the solver.
+      if (armed.kind === "marquee") return;
 
       const store = useAssemblyStore.getState();
       const rect = containerRef.current?.getBoundingClientRect();
@@ -882,6 +966,22 @@ export function Viewport() {
       if (armed) {
         orbit.enabled = true;
         dom.style.cursor = "";
+        if (armed.kind === "marquee") {
+          hideMarqueeRect();
+          if (!armed.dragging) return; // a plain Alt+click without moving selects nothing
+          const rect = marqueeScreenRect(armed.startScreen, { x: e.clientX, y: e.clientY });
+          const hitIds: string[] = [];
+          for (const [id, visual] of visualsRef.current) {
+            const box = projectedScreenBox(visual);
+            if (box && rectsOverlap(rect, box)) hitIds.push(id);
+          }
+          const store = useAssemblyStore.getState();
+          if (hitIds.length > 0) {
+            if (!e.shiftKey) store.clearMultiSelect();
+            for (const id of hitIds) store.toggleMultiSelect(id);
+          }
+          return;
+        }
         if (armed.dragging) {
           useAssemblyStore.getState().runSolve();
           return;
@@ -1207,6 +1307,12 @@ export function Viewport() {
   return (
     <div className="relative h-full w-full">
       <div ref={containerRef} className="h-full w-full" />
+      <div
+        ref={marqueeRef}
+        hidden
+        className="pointer-events-none absolute"
+        style={{ border: "1px solid #4fa3ff", background: "rgba(79,163,255,0.15)" }}
+      />
       {povCameraState?.isCamera && (
         <div
           className="pointer-events-none absolute overflow-hidden rounded"
