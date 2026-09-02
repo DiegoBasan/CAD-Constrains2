@@ -4,6 +4,7 @@ import type { AxisConstraint, AxisKey, EntityRef, FaceInfo, EdgeInfo, ImportedAs
 import { countConnectedBodies, splitPartMesh } from "../occ/split";
 import { applicableRelationTypes, resolveEntity, type Relation, type RelationType } from "./relations";
 import { solveAssembly } from "./solver";
+import { arcLerpPose } from "./arc";
 
 export type { AxisKey };
 
@@ -94,6 +95,16 @@ export interface Keyframe {
    * saved before this field existed, and any new one saved via the default "+" action,
    * has no explicit value and just plays at the old fixed pace. */
   durationMs?: number;
+  /** Per-part "via" points for the segment *ending* at this keyframe (same
+   * "belongs to the segment before it" convention as durationMs) — teaching one for a
+   * part makes that part travel a 3-point circular arc through it during this segment,
+   * like teaching a C1 (circular) move on a Fanuc: the start/end come from the
+   * surrounding keyframes' own poses, and the via point (captured from wherever the
+   * part happens to be live, via setArcVia) pins down which of the circle's two arcs it
+   * sweeps. A part with no entry here just plays this segment as a straight lerp, same
+   * as before this existed. Position only — see arcLerpPose in arc.ts, which still
+   * slerps rotation normally between the two keyframes' poses. */
+  arcVia?: Map<string, Vec3>;
 }
 
 export const DEFAULT_SEGMENT_MS = 1400;
@@ -261,6 +272,13 @@ interface AssemblyStore {
    * so — also like them — pushing the undo snapshot is the caller's job (onCommitStart),
    * not this action's; pushing here would flood history with one entry per keystroke. */
   setKeyframeDurationSec: (id: string, seconds: number) => void;
+  /** Teaches an arc via point for `partId` in the segment ending at keyframe `id`,
+   * captured from that part's current live position — like moving a robot's TCP to a
+   * point and hitting "teach" mid-move. Requires the part to actually have a pose in
+   * both this keyframe and the previous one (an arc needs a real start and end to
+   * interpolate between); does nothing otherwise. */
+  setArcVia: (keyframeId: string, partId: string) => void;
+  clearArcVia: (keyframeId: string, partId: string) => void;
   /** Jumps the live assembly to a saved keyframe's pose (re-solved, so it still
    * respects every relation even if the assembly has changed since it was saved). */
   previewKeyframe: (id: string) => void;
@@ -508,7 +526,7 @@ interface ProjectFile {
   parts: [string, SerializedPartState][];
   relations: Relation[];
   groups: Group[];
-  keyframes: { id: string; name: string; poses: [string, Pose][]; durationMs?: number }[];
+  keyframes: { id: string; name: string; poses: [string, Pose][]; durationMs?: number; arcVia?: [string, Vec3][] }[];
 }
 
 function serializePartState(st: PartState): SerializedPartState {
@@ -1266,6 +1284,31 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
     set({ keyframes: get().keyframes.map((k) => (k.id === id ? { ...k, durationMs } : k)) });
   },
 
+  setArcVia: (keyframeId, partId) => {
+    const { keyframes, parts } = get();
+    const index = keyframes.findIndex((k) => k.id === keyframeId);
+    if (index <= 0) return; // no previous keyframe -> no segment to arc through
+    const kf = keyframes[index];
+    const prev = keyframes[index - 1];
+    if (!kf.poses.has(partId) || !prev.poses.has(partId)) return;
+    const current = parts.get(partId);
+    if (!current) return;
+    get().pushHistorySnapshot();
+    const arcVia = new Map(kf.arcVia);
+    arcVia.set(partId, [...current.pose.position]);
+    set({ keyframes: keyframes.map((k, i) => (i === index ? { ...k, arcVia } : k)) });
+  },
+
+  clearArcVia: (keyframeId, partId) => {
+    const { keyframes } = get();
+    const index = keyframes.findIndex((k) => k.id === keyframeId);
+    if (index === -1 || !keyframes[index].arcVia?.has(partId)) return;
+    get().pushHistorySnapshot();
+    const arcVia = new Map(keyframes[index].arcVia);
+    arcVia.delete(partId);
+    set({ keyframes: keyframes.map((k, i) => (i === index ? { ...k, arcVia } : k)) });
+  },
+
   previewKeyframe: (id) => {
     const { keyframes, parts, relations, isPlaying } = get();
     if (isPlaying) return;
@@ -1302,7 +1345,7 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
       set({ parts: applyPosesToParts(parts, result.poses) });
     }
 
-    function runSegment(from: Map<string, Pose>, to: Map<string, Pose>, durationMs: number): Promise<void> {
+    function runSegment(from: Map<string, Pose>, to: Map<string, Pose>, durationMs: number, arcVia: Map<string, Vec3> | undefined): Promise<void> {
       return new Promise((resolve) => {
         const start = performance.now();
         const ids = new Set([...from.keys(), ...to.keys()]);
@@ -1316,7 +1359,8 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
           for (const id of ids) {
             const a = from.get(id);
             const b = to.get(id);
-            if (a && b) seed.set(id, lerpPose(a, b, t));
+            const via = arcVia?.get(id);
+            if (a && b) seed.set(id, via ? arcLerpPose(a, via, b, t) : lerpPose(a, b, t));
             else if (b) seed.set(id, b);
           }
           applySeed(seed);
@@ -1331,7 +1375,8 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
       do {
         for (let i = 0; i < keyframes.length - 1; i++) {
           if (token !== playbackToken) break;
-          await runSegment(keyframes[i].poses, keyframes[i + 1].poses, keyframes[i + 1].durationMs ?? DEFAULT_SEGMENT_MS);
+          const next = keyframes[i + 1];
+          await runSegment(keyframes[i].poses, next.poses, next.durationMs ?? DEFAULT_SEGMENT_MS, next.arcVia);
         }
       } while (token === playbackToken && get().loopPlayback);
       if (token === playbackToken) {
@@ -1414,7 +1459,13 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
       parts: Array.from(parts.entries()).map(([id, st]) => [id, serializePartState(st)]),
       relations,
       groups,
-      keyframes: keyframes.map((k) => ({ id: k.id, name: k.name, poses: Array.from(k.poses.entries()), durationMs: k.durationMs })),
+      keyframes: keyframes.map((k) => ({
+        id: k.id,
+        name: k.name,
+        poses: Array.from(k.poses.entries()),
+        durationMs: k.durationMs,
+        arcVia: k.arcVia ? Array.from(k.arcVia.entries()) : undefined,
+      })),
     };
     return JSON.stringify(file);
   },
@@ -1432,7 +1483,13 @@ export const useAssemblyStore = create<AssemblyStore>((set, get) => ({
     get().pushHistorySnapshot();
 
     const parts = new Map<string, PartState>(file.parts.map(([id, st]) => [id, deserializePartState(st)]));
-    const keyframes: Keyframe[] = file.keyframes.map((k) => ({ id: k.id, name: k.name, poses: new Map(k.poses), durationMs: k.durationMs }));
+    const keyframes: Keyframe[] = file.keyframes.map((k) => ({
+      id: k.id,
+      name: k.name,
+      poses: new Map(k.poses),
+      durationMs: k.durationMs,
+      arcVia: k.arcVia ? new Map(k.arcVia) : undefined,
+    }));
 
     // Bump every id counter past whatever this file contains, so anything created
     // *after* importing never collides with an id the import just brought in.
